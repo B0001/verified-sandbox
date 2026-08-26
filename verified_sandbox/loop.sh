@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+# Drain the beads queue, one containerised worker per bead.
+#
+# Preflight (config, token checks, the hooksPath guard) runs in __init__.py
+# before this is exec'd; it arrives with $SANDBOX_CONF sourced-ready and the
+# cwd already at the repo root.
+#
+# Each bead gets a FRESH container and a fresh context window -- that is the
+# point. A single -p session trying to do a whole phase runs out of context
+# mid-task; one bead per session does not.
+#
+# Notes on the docker invocation (DOCKER_ARGS is assembled in Python):
+#   * The mounted host .venv symlinks into the host's python install and is
+#     dead in the container, so uv is pointed at /tmp/venv instead.
+#   * The uv volumes keep the interpreter + wheel downloads from repeating on
+#     every worker.
+#   * The container gets the host's network but NOT the host's shell env, so
+#     any API token a bead needs is forwarded explicitly -- an unauthenticated
+#     worker hits a rate limit and files a bug that is really a 403. Secrets
+#     go through `forward-env`, which emits a bare `-e NAME`, NOT
+#     `-e NAME="$NAME"`: the second form puts the value in docker's argv where
+#     any user on the host can read it out of `ps`.
+#   * Do NOT add a volume for /home/node/.claude. The config claude reads is
+#     /home/node/.claude.json, which sits OUTSIDE that directory; persisting
+#     only the directory leaves a stale .claude/backups/ next to a missing
+#     config and every run after the first dies with "Claude configuration
+#     file not found". Durable output is sandbox-handoffs/, not session state.
+
+set -uo pipefail
+
+# shellcheck disable=SC1090
+source "$SANDBOX_CONF"   # DOCKER_ARGS, IMAGE, MAX_ATTEMPTS, MAX_WORKERS, PROMPT_FILE, HANDOFF_DIR
+
+LOCK_DIR=".sandbox.lock"
+
+mkdir -p "$HANDOFF_DIR"
+
+# Two concurrent loops would re-dispatch each other's in-progress beads, so
+# take an exclusive lock. mkdir is atomic; a stale dir after a hard kill is
+# removed by hand, and the message says so.
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  echo "another sandbox run appears to be in progress."
+  echo "if it is not, remove the stale lock: rmdir $LOCK_DIR"
+  exit 1
+fi
+trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+
+# Ctrl-C must stop the RUN, not just the worker. `docker run -it` forwards the
+# terminal's SIGINT to the container, claude catches it and exits non-zero, and
+# docker itself returns normally -- so bash sees an ordinary failed command and
+# dispatches the next worker. You cannot interrupt the loop, and every Ctrl-C
+# burns an attempt until MAX_ATTEMPTS parks a bead that was never actually
+# tried. The trap fires once the foreground docker returns, which is enough.
+trap 'echo; echo "==> interrupted; stopping."; exit 130' INT
+
+# Docker initialises a named volume root-owned when its mount path doesn't
+# already exist in the image, so the two uv volumes come up as root:root and
+# uv is unusable for the node (uid 1000) user every worker runs as. Relocating
+# the mounts does not help -- a fresh volume at any new path is root-owned too
+# (tested). chown the volume contents once from a throwaway root container;
+# it persists into every later mount, so this is a no-op after the first run.
+#
+# Every NAMED volume needs this, not just the two uv ones -- a volume added
+# through [tool.sandbox] volumes is root-owned exactly the same way, and a
+# toolchain cache the worker cannot write to is worse than none at all: it
+# re-downloads silently, every session, and looks like a slow bead.
+chown_mounts=()
+chown_paths=()
+mount_i=0
+for vol in "${CHOWN_VOLUMES[@]}"; do
+  chown_mounts+=(-v "$vol:/chown$mount_i")
+  chown_paths+=("/chown$mount_i")
+  mount_i=$((mount_i + 1))
+done
+docker run --rm "${chown_mounts[@]}" busybox \
+  chown -R 1000:1000 "${chown_paths[@]}" || { echo "could not chown volumes"; exit 1; }
+
+run_worker() {
+  docker run -it --rm "${DOCKER_ARGS[@]}" "$IMAGE" \
+    -p "$1" --dangerously-skip-permissions
+}
+
+# Beads that hit MAX_ATTEMPTS. They are skipped for the rest of the run and
+# reported at the end. This list is the whole reason a bad bead no longer kills
+# the run: parking one and moving on drains the queue, aborting on it does not.
+#
+# It starts from `park` in [tool.sandbox]: beads a worker structurally cannot
+# finish, no matter how many sessions it gets -- one asking for an independent
+# human reviewer, say. Those are never dispatched, so they never burn an
+# attempt, and they are reported separately at the end because "deliberately
+# never dispatched" and "tried twice and failed" need different reactions.
+PARKED="$PARK_ALWAYS"
+
+is_parked() { case " $PARKED " in *" $1 "*) return 0;; *) return 1;; esac; }
+
+ids_by_status() {
+  bd list --status="$1" --json 2>/dev/null \
+    | python3 -c 'import json,sys
+try: print(" ".join(i["id"] for i in json.load(sys.stdin)))
+except Exception: pass'
+}
+
+# Epics are excluded from dispatch: a parent is marked in_progress as soon as
+# any child is claimed, so it sits in_progress permanently and is not work a
+# worker can finish. Dispatching one burns a whole session on nothing.
+stale_ids() {
+  bd list --status=in_progress --json 2>/dev/null \
+    | python3 -c 'import json,sys
+try: print(" ".join(i["id"] for i in json.load(sys.stdin) if i.get("issue_type") != "epic"))
+except Exception: pass'
+}
+
+# Epics are excluded here for the same reason as above. `bd ready` surfaces an
+# epic whose children are all still unstarted -- it only disappears from the
+# ready queue once a child is claimed and the parent flips to in_progress -- so
+# without this filter the loop can dispatch a worker onto a bead nobody can
+# finish.
+ready_ids() {
+  bd ready --json 2>/dev/null \
+    | python3 -c 'import json,sys
+try: print(" ".join(i["id"] for i in json.load(sys.stdin) if i.get("issue_type") != "epic"))
+except Exception: pass'
+}
+
+# Both selectors skip parked ids. Skipping them in the READY path matters as
+# much as in the stale path: a worker that leaves its bead open (rather than
+# claimed) puts it straight back at the head of `bd ready`, and without the
+# skip the loop re-dispatches it forever.
+first_unparked() {
+  for id in $1; do
+    is_parked "$id" && continue
+    echo "$id"
+    return
+  done
+}
+
+next_ready() { first_unparked "$(ready_ids)"; }
+
+# bd ready EXCLUDES in_progress beads. A worker that claims one and then dies,
+# stalls, or hits a limit leaves it invisible to the queue forever -- so
+# "nothing ready" is not the same as "nothing left". This is the fallback that
+# makes the difference visible, and it is what gives MAX_ATTEMPTS something to
+# count: a stale claim that keeps failing now comes back instead of vanishing.
+#
+# It fires only once the ready queue is drained, so strays accumulate during a
+# long run and are swept at the end. That is deliberate -- fresh work first --
+# but it means a run that ends early (MAX_WORKERS, a kill) never reaches the
+# sweep. The end-of-run report names anything left, so it is visible either way.
+next_stale() { first_unparked "$(stale_ids)"; }
+
+# Emptiness is the trigger for the triage pass below, and triage FILES BEADS
+# -- it is the only branch of this script that writes. The selectors above
+# swallow any error from bd (deliberately: one unparseable record must not
+# abort a whole drain), so an empty string from them means EITHER "the queue
+# is empty" OR "bd failed", and those are not the same fact. Confirm bd is
+# healthy before trusting emptiness; otherwise a transient bd failure files a
+# duplicate queue on top of the real one. Observed doing exactly that.
+queue_empty() {
+  bd ready --json >/dev/null 2>&1 || {
+    echo "FATAL: 'bd ready --json' failed, so an empty queue cannot be trusted."
+    echo "       Refusing to run triage -- it would file beads over a queue that"
+    echo "       may well exist. Fix bd, then re-run."
+    exit 1
+  }
+  [ -z "$(next_ready)" ] && [ -z "$(next_stale)" ]
+}
+
+# Empty queue on the first pass means the phase has not been triaged yet, not
+# that the work is done. Seed it: one worker that files beads and writes no
+# code.
+if queue_empty; then
+  echo "==> queue empty; running triage pass to file beads"
+  run_worker "$(cat "$PROMPT_FILE")
+
+---
+
+# YOUR TASK THIS SESSION: triage only
+
+Do NOT write or modify any code, test, or document this session. Your entire
+job is to turn the objectives above into a work queue.
+
+File one bead per discrete, independently-completable unit of work with
+\`bd create\`, and use \`bd dep add\` where one genuinely blocks another. Each
+bead's description must carry enough detail that a fresh session with no
+memory of this one can execute it from \`bd show\` alone: what is wrong, how
+you confirmed it, and what evidence would close it. Reproduce before you
+file -- a bead asserting a problem you did not actually observe wastes a whole
+worker session.
+
+Leave every bead open and unclaimed. Then stop and report the list."
+  echo "==> triage complete"
+fi
+
+last_id=""
+attempts=0
+workers=0
+
+while :; do
+  TASK_ID="$(next_ready)"
+
+  if [ -z "$TASK_ID" ]; then
+    TASK_ID="$(next_stale)"
+    if [ -n "$TASK_ID" ]; then
+      echo "==> nothing ready; re-dispatching stale claim: $TASK_ID"
+    fi
+  fi
+
+  if [ -z "$TASK_ID" ]; then
+    echo "==> queue drained after $workers worker(s)"
+    break
+  fi
+
+  # Livelock guard. Counting consecutive re-dispatches of the SAME id is what
+  # detects a bead a worker cannot finish; parking it (rather than exiting) is
+  # what lets the other five stranded beads still get their turn.
+  if [ "$TASK_ID" = "$last_id" ]; then
+    attempts=$((attempts + 1))
+  else
+    attempts=1
+    last_id="$TASK_ID"
+  fi
+  if [ "$attempts" -gt "$MAX_ATTEMPTS" ]; then
+    echo "==> PARKED $TASK_ID: came back unfinished $MAX_ATTEMPTS times."
+    echo "    Inspect with: bd show $TASK_ID"
+    echo "    Its handoff (if any): $HANDOFF_DIR/$TASK_ID.md"
+    PARKED="$PARKED $TASK_ID"
+    last_id=""
+    attempts=0
+    continue
+  fi
+
+  workers=$((workers + 1))
+  if [ "$workers" -gt "$MAX_WORKERS" ]; then
+    echo "==> ABORT: hit MAX_WORKERS=$MAX_WORKERS. Queue is growing, not draining."
+    break
+  fi
+
+  echo "==> worker $workers: $TASK_ID (attempt $attempts)"
+
+  run_worker "$(cat "$PROMPT_FILE")
+
+---
+
+# YOUR TASK THIS SESSION: bead $TASK_ID
+
+Run \`bd show $TASK_ID\` first -- it is the specification. Everything above is
+standing context for this repo; the objectives section is background, not your
+assignment. Do only this bead.
+
+If it is already marked in_progress, a previous worker claimed it and did not
+finish. Read its notes, do not assume its partial work is correct, and check
+the working tree for what it left behind before continuing.
+
+Claim it with \`bd update $TASK_ID --claim\` before you start.
+
+Close it with \`bd close $TASK_ID\` ONLY when the evidence the bead's
+acceptance criteria ask for exists and the test suite passes. If you cannot
+finish it, leave it open, say why in \`bd update $TASK_ID --notes=...\`, and
+stop -- do not close a bead to make the queue move. If the bead turns out to
+be wrong or already done, close it with \`--reason\` explaining that, which is
+a real outcome and not a failure.
+
+If you discover work outside this bead's scope, file it as a new bead. Do not
+do it now.
+
+Write your handoff to \`$HANDOFF_DIR/$TASK_ID.md\` BEFORE you close the bead.
+A session that dies after closing and before writing leaves no trace of how
+the work was done; one that dies the other way round is merely unfinished."
+
+  status=$?
+  [ "$status" -ne 0 ] && echo "==> worker exited $status"
+done
+
+stranded="$(ids_by_status in_progress)"
+open_left="$(ids_by_status open)"
+
+echo
+echo "Handoffs:   $HANDOFF_DIR/"
+echo "Open beads: $(printf '%s' "$open_left" | wc -w | tr -d ' ')"
+echo "Nothing was committed or pushed. Review with: git status && git diff"
+
+exit_code=0
+
+# Only the ones this run actually gave up on. A bead from `park` was never
+# dispatched, so reporting it as "tried twice and failed" would be a lie, and
+# failing the run over a deliberate config choice would make a clean drain
+# impossible to ever observe.
+failed_park=""
+for id in $PARKED; do
+  case " $PARK_ALWAYS " in *" $id "*) continue;; esac
+  failed_park="$failed_park $id"
+done
+
+if [ -n "$failed_park" ]; then
+  echo
+  echo "PARKED -- dispatched $MAX_ATTEMPTS times and never finished:"
+  for id in $failed_park; do echo "    $id"; done
+  echo "These need a human. Start with the bead and its handoff."
+  exit_code=1
+fi
+
+if [ -n "$PARK_ALWAYS" ]; then
+  echo
+  echo "Never dispatched (park list in [tool.sandbox]):"
+  for id in $PARK_ALWAYS; do echo "    $id"; done
+fi
+
+# "Queue drained" must never be reported while beads sit claimed-but-unclosed.
+# Parked ids are listed above; anything here that is not parked is a claim no
+# worker ever came back to -- usually a session that died mid-bead.
+if [ -n "$stranded" ]; then
+  unswept=""
+  for id in $stranded; do
+    is_parked "$id" || unswept="$unswept $id"
+  done
+  if [ -n "$unswept" ]; then
+    echo
+    echo "STRANDED -- claimed but never closed:"
+    for id in $unswept; do echo "    $id"; done
+    echo "These are NOT done. Inspect with: bd show <id>"
+    exit_code=1
+  fi
+fi
+
+exit "$exit_code"

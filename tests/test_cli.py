@@ -191,3 +191,59 @@ def test_proxy_check_maps_the_container_hostname_back_to_loopback():
         vs.check_proxy({"env": {"ANTHROPIC_BASE_URL": f"http://host.docker.internal:{port}"}})
     finally:
         srv.close()
+
+
+def _repo_with_prereg(tmp_path):
+    root = _git_repo(tmp_path)
+    (root / "predictions").mkdir()
+    f = root / "predictions" / "PREREGISTRATION.md"
+    f.write_text("# Pre-registration\n\n## P1\nStatus: open\nClaim: X displaces from Y.\n")
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "-c", "core.hooksPath=", "commit", "-qm", "init"],
+                   cwd=root, check=True, capture_output=True)
+    return root, f
+
+
+def _commit(root, msg):
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True, capture_output=True)
+    return subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", msg],
+        cwd=root, capture_output=True, text=True)
+
+
+def test_appending_a_prediction_is_allowed(tmp_path):
+    root, f = _repo_with_prereg(tmp_path)
+    vs.cmd_install_hooks(root, {"append-only": ["predictions/PREREGISTRATION.md"]})
+    f.write_text(f.read_text() + "\n## P2\nStatus: open\nClaim: Z.\n")
+    assert _commit(root, "register P2").returncode == 0, "appending must be allowed"
+
+
+def test_amending_a_registered_prediction_is_refused(tmp_path):
+    """The whole value of a preregistration is that it could not have been
+    changed after the measurement. This binds humans too -- a worker cannot
+    commit, but it can leave an amended file for a human to commit unnoticed."""
+    root, f = _repo_with_prereg(tmp_path)
+    vs.cmd_install_hooks(root, {"append-only": ["predictions/PREREGISTRATION.md"]})
+    f.write_text(f.read_text().replace("X displaces from Y", "X coincides with Y"))
+    result = _commit(root, "quietly reword the claim")
+    assert result.returncode != 0, "an amended prediction was committed"
+    assert "append-only" in result.stderr
+
+
+def test_deleting_a_prediction_is_refused(tmp_path):
+    root, f = _repo_with_prereg(tmp_path)
+    vs.cmd_install_hooks(root, {"append-only": ["predictions/PREREGISTRATION.md"]})
+    f.write_text("# Pre-registration\n")
+    assert _commit(root, "drop P1").returncode != 0, "a deleted prediction was committed"
+
+
+def test_append_only_guard_is_idempotent_and_coexists_with_the_actor_guard(tmp_path):
+    root, _ = _repo_with_prereg(tmp_path)
+    cfg = {"append-only": ["predictions/PREREGISTRATION.md"]}
+    vs.cmd_install_hooks(root, cfg)
+    first = (root / vs.HOOKS_DIR / "pre-commit").read_text()
+    vs.cmd_install_hooks(root, cfg)
+    assert (root / vs.HOOKS_DIR / "pre-commit").read_text() == first, "not idempotent"
+    assert "BEADS_ACTOR" in first and "append-only" in first
+    assert first.startswith("#!/usr/bin/env sh\n")

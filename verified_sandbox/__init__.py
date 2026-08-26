@@ -192,7 +192,8 @@ def check_hooks(root):
                 "       hooks and can drop it. Fix with: sandbox install-hooks")
 
 
-def cmd_install_hooks(root):
+def cmd_install_hooks(root, cfg=None):
+    cfg = cfg or {}
     hooks = root / HOOKS_DIR
     hooks.mkdir(parents=True, exist_ok=True)
     for hook in GUARDED_HOOKS:
@@ -205,9 +206,61 @@ def cmd_install_hooks(root):
             path.write_text(head + "\n" + GUARD % hook + tail)
             print(f"  {HOOKS_DIR}/{hook}: guard installed")
         path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    install_append_only(hooks / "pre-commit", cfg.get("append-only", []))
+
     # Relative, so it resolves the same on the host and inside the container.
     subprocess.run(["git", "config", "core.hooksPath", HOOKS_DIR], cwd=root, check=True)
     print(f"  core.hooksPath = {HOOKS_DIR}")
+
+
+def install_append_only(path, files):
+    """Refuse commits that delete or rewrite lines in an append-only file.
+
+    Unlike the BEADS_ACTOR guard, this one binds humans too, and it has to.
+    A worker cannot commit -- but it CAN edit a preregistration in the working
+    tree and leave it for a human to commit inside a large diff, which is the
+    same outcome by a slower route. The file's own policy is the rule being
+    enforced: adding an entry is fine, changing a registered one is not, and
+    outcomes belong in a separate file. A prediction that can be amended after
+    the measurement is worth exactly nothing, which is the whole reason the
+    timestamp on it has value.
+    """
+    text = path.read_text() if path.is_file() else "#!/usr/bin/env sh\n"
+    marker = "# --- append-only guard"
+    if marker in text:
+        start = text.index(marker)
+        end = text.index("# --- end append-only guard ---\n") + len("# --- end append-only guard ---\n")
+        text = text[:start] + text[end:]
+    if not files:
+        path.write_text(text)
+        print(f"  {path.parent.name}/{path.name}: no append-only files configured")
+        return
+
+    quoted = " ".join(shlex.quote(f) for f in files)
+    block = f"""{marker} (managed by `sandbox install-hooks`) ---
+# These paths are append-only by policy. Adding lines is fine; deleting or
+# rewriting existing ones is refused -- for workers and humans alike, because
+# a worker leaves edits in the tree for a human to commit.
+for _ao_f in {quoted}; do
+  _ao_del="$(git diff --cached --numstat -- "$_ao_f" | awk '{{print $2}}')"
+  # numstat prints "-" for a binary file; only a real nonzero count is a delete.
+  case "$_ao_del" in
+    ""|0|-) ;;
+    *)
+      echo >&2 "pre-commit: refusing -- $_ao_f is append-only and this commit"
+      echo >&2 "  removes or rewrites $_ao_del existing line(s). Add a new entry,"
+      echo >&2 "  or record the result in a separate outcomes file."
+      exit 1
+      ;;
+  esac
+done
+# --- end append-only guard ---
+"""
+    head, _, tail = text.partition("\n")
+    path.write_text(head + "\n" + block + tail)
+    path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    print(f"  {path.parent.name}/{path.name}: append-only guard on {', '.join(files)}")
 
 
 def cmd_run(root, cfg):
@@ -246,7 +299,7 @@ def main():
     cmd = argv[0] if argv else "run"
     root = repo_root()
     if cmd == "install-hooks":
-        cmd_install_hooks(root)
+        cmd_install_hooks(root, load_config(root))
     elif cmd == "run":
         cmd_run(root, load_config(root))
     else:

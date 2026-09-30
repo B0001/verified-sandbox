@@ -127,6 +127,13 @@ def conf_text(root, cfg):
         f"IMAGE={shlex.quote(cfg.get('image', 'claude'))}",
         f"MAX_ATTEMPTS={int(cfg.get('max-attempts', 2))}",
         f"MAX_WORKERS={int(cfg.get('max-workers', 25))}",
+        # A non-zero worker exit inside this many seconds is treated as
+        # infrastructure (rate limit, dead token, dead proxy), not as the bead
+        # failing -- see the fast-failure block in loop.sh. The floor for a
+        # real attempt is minutes, so 90s is generous; raise it if a repo's
+        # workers legitimately finish faster than that.
+        f"MIN_WORKER_SECONDS={int(cfg.get('min-worker-seconds', 90))}",
+        f"FAST_FAIL_SLEEP={int(cfg.get('fast-fail-sleep', 60))}",
         f"PROMPT_FILE={shlex.quote(cfg.get('prompt-file', 'sandbox-prompt.md'))}",
         f"HANDOFF_DIR={shlex.quote(cfg.get('handoff-dir', 'sandbox-handoffs'))}",
         "",

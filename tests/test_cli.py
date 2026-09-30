@@ -4,6 +4,7 @@ Not coverage for its own sake -- each of these encodes a bug that actually
 happened in one of the hand-maintained copies.
 """
 
+import json
 import shlex
 import subprocess
 from pathlib import Path
@@ -247,3 +248,103 @@ def test_append_only_guard_is_idempotent_and_coexists_with_the_actor_guard(tmp_p
     assert (root / vs.HOOKS_DIR / "pre-commit").read_text() == first, "not idempotent"
     assert "BEADS_ACTOR" in first and "append-only" in first
     assert first.startswith("#!/usr/bin/env sh\n")
+
+
+IDS = Path(vs.__file__).with_name("ids.py")
+
+
+def _ids(stdin, *skip):
+    return subprocess.run(["python3", str(IDS), *skip], input=stdin,
+                          capture_output=True, text=True)
+
+
+def test_ids_reads_both_bd_json_envelopes_and_drops_epics():
+    # bd 1.1 wrapped --json in {"data": [...]}; older versions emitted a bare
+    # list. The loop only knew the bare list, so under bd 1.1.2 every selector
+    # went silent, the loop believed the queue was empty, and the triage pass
+    # filed beads on top of a live one (certkit, 2026-08-26).
+    issues = [{"id": "a-1", "issue_type": "task"}, {"id": "e-1", "issue_type": "epic"}]
+    for payload in (issues, {"data": issues}, {"issues": issues}):
+        got = _ids(json.dumps(payload), "epic")
+        assert got.returncode == 0, got.stderr
+        assert got.stdout.split() == ["a-1"], payload
+
+
+def test_ids_refuses_an_unknown_shape_rather_than_reporting_an_empty_queue():
+    # Exiting nonzero is the whole point: queue_empty trusts a silent selector
+    # and runs triage, which writes. "I cannot read this" must not look like
+    # "there is nothing to do".
+    assert _ids('{"unexpected": 1}').returncode != 0
+    assert _ids("not json at all").returncode != 0
+
+
+def _fake_run(tmp_path, docker_exit, docker_sleep=0, max_attempts=2, min_worker_seconds=90):
+    """Drive the real loop.sh against a fake `bd` and a fake `docker`.
+
+    The rate-limit behaviour lives in the loop, not in Python, so nothing
+    short of running it actually checks it.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "bd").write_text(
+        '#!/usr/bin/env bash\n'
+        # One ready, non-epic bead; nothing in progress. Every other bd call
+        # (update/close/notes) is a no-op the worker would have made.
+        'case "$1 $2" in\n'
+        '  "ready --json") echo \'{"data":[{"id":"t-1","issue_type":"bug"}]}\' ;;\n'
+        '  "list --status=in_progress") echo \'{"data":[]}\' ;;\n'
+        '  *) echo \'{"data":[]}\' ;;\n'
+        'esac\n'
+    )
+    (bin_dir / "docker").write_text(
+        '#!/usr/bin/env bash\n'
+        # The startup chown container must succeed; only the worker fails.
+        'for a in "$@"; do [ "$a" = "busybox" ] && exit 0; done\n'
+        f'sleep {docker_sleep}\n'
+        f'exit {docker_exit}\n'
+    )
+    for f in bin_dir.iterdir():
+        f.chmod(0o755)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "prompt.md").write_text("standing context")
+    conf = tmp_path / "conf.sh"
+    conf.write_text(
+        "DOCKER_ARGS=(--rm)\nCHOWN_VOLUMES=(uv-cache)\nPARK_ALWAYS=\nIMAGE=fake\n"
+        f"MAX_ATTEMPTS={max_attempts}\nMAX_WORKERS=25\n"
+        "PROMPT_FILE=prompt.md\nHANDOFF_DIR=handoffs\n"
+        f"MIN_WORKER_SECONDS={min_worker_seconds}\nFAST_FAIL_SLEEP=1\n"
+    )
+    import os
+    loop = Path(vs.__file__).parent / "loop.sh"
+    return subprocess.run(
+        ["bash", str(loop)], cwd=repo, capture_output=True, text=True, timeout=120,
+        env={**os.environ, "SANDBOX_CONF": str(conf),
+             "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+    )
+
+
+def test_a_rate_limited_worker_is_not_charged_to_the_bead(tmp_path):
+    # A worker that dies in seconds never reached the bead. Before this, two
+    # such dispatches PARKED a healthy bead and the run reported it as work
+    # that "came back unfinished twice" -- a dead credential reading as hard
+    # work. It must abort instead, park nothing, and exit non-zero.
+    out = _fake_run(tmp_path, docker_exit=1)
+    combined = out.stdout + out.stderr
+    assert "ABORT" in combined, combined
+    assert "PARKED" not in combined, "a rate limit must never park a bead"
+    assert out.returncode != 0, "an infrastructure abort must not look like a clean drain"
+
+
+def test_a_slow_failure_is_still_the_beads_problem(tmp_path):
+    # The mirror image, and the reason the guard is time-based rather than
+    # "swallow every non-zero exit": a worker that ran long enough to have
+    # actually tried and still failed IS the bead's problem, and must still
+    # reach MAX_ATTEMPTS and park. A guard that ate this too would make a
+    # genuinely undoable bead invisible.
+    out = _fake_run(tmp_path, docker_exit=1, docker_sleep=2,
+                    max_attempts=1, min_worker_seconds=1)
+    combined = out.stdout + out.stderr
+    assert "PARKED" in combined, combined
+    assert "ABORT" not in combined, "a slow failure is not an infrastructure abort"

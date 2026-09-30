@@ -29,7 +29,8 @@
 set -uo pipefail
 
 # shellcheck disable=SC1090
-source "$SANDBOX_CONF"   # DOCKER_ARGS, IMAGE, MAX_ATTEMPTS, MAX_WORKERS, PROMPT_FILE, HANDOFF_DIR
+source "$SANDBOX_CONF"   # DOCKER_ARGS, IMAGE, MAX_ATTEMPTS, MAX_WORKERS, PROMPT_FILE,
+                         # HANDOFF_DIR, MIN_WORKER_SECONDS, FAST_FAIL_SLEEP
 
 LOCK_DIR=".sandbox.lock"
 
@@ -76,7 +77,7 @@ docker run --rm "${chown_mounts[@]}" busybox \
   chown -R 1000:1000 "${chown_paths[@]}" || { echo "could not chown volumes"; exit 1; }
 
 run_worker() {
-  docker run -it --rm "${DOCKER_ARGS[@]}" "$IMAGE" \
+  docker run -it --rm --init "${DOCKER_ARGS[@]}" "$IMAGE" \
     -p "$1" --dangerously-skip-permissions
 }
 
@@ -93,21 +94,21 @@ PARKED="$PARK_ALWAYS"
 
 is_parked() { case " $PARKED " in *" $1 "*) return 0;; *) return 1;; esac; }
 
+# Shape handling and the id extraction live in ids.py, so a change in bd's
+# --json envelope is one edit rather than three, and is testable. It exits
+# nonzero on a shape it does not recognise; pipefail carries that out of these
+# functions, which is what queue_empty checks before trusting an empty queue.
+IDS="$(dirname "$0")/ids.py"
+
 ids_by_status() {
-  bd list --status="$1" --json 2>/dev/null \
-    | python3 -c 'import json,sys
-try: print(" ".join(i["id"] for i in json.load(sys.stdin)))
-except Exception: pass'
+  bd list --status="$1" --json 2>/dev/null | python3 "$IDS"
 }
 
 # Epics are excluded from dispatch: a parent is marked in_progress as soon as
 # any child is claimed, so it sits in_progress permanently and is not work a
 # worker can finish. Dispatching one burns a whole session on nothing.
 stale_ids() {
-  bd list --status=in_progress --json 2>/dev/null \
-    | python3 -c 'import json,sys
-try: print(" ".join(i["id"] for i in json.load(sys.stdin) if i.get("issue_type") != "epic"))
-except Exception: pass'
+  bd list --status=in_progress --json 2>/dev/null | python3 "$IDS" epic
 }
 
 # Epics are excluded here for the same reason as above. `bd ready` surfaces an
@@ -116,10 +117,7 @@ except Exception: pass'
 # without this filter the loop can dispatch a worker onto a bead nobody can
 # finish.
 ready_ids() {
-  bd ready --json 2>/dev/null \
-    | python3 -c 'import json,sys
-try: print(" ".join(i["id"] for i in json.load(sys.stdin) if i.get("issue_type") != "epic"))
-except Exception: pass'
+  bd ready --json 2>/dev/null | python3 "$IDS" epic
 }
 
 # Both selectors skip parked ids. Skipping them in the READY path matters as
@@ -155,11 +153,17 @@ next_stale() { first_unparked "$(stale_ids)"; }
 # is empty" OR "bd failed", and those are not the same fact. Confirm bd is
 # healthy before trusting emptiness; otherwise a transient bd failure files a
 # duplicate queue on top of the real one. Observed doing exactly that.
+# The health check has to run the SAME pipeline the selectors do, parse and
+# all. Checking only `bd ready`'s exit code does not: bd 1.1.2 exits 0 while
+# emitting an envelope the old parser could not read, so the check passed, the
+# selectors returned nothing, and triage filed beads over a live queue --
+# exactly the failure this function exists to prevent.
 queue_empty() {
-  bd ready --json >/dev/null 2>&1 || {
-    echo "FATAL: 'bd ready --json' failed, so an empty queue cannot be trusted."
-    echo "       Refusing to run triage -- it would file beads over a queue that"
-    echo "       may well exist. Fix bd, then re-run."
+  ready_ids >/dev/null || {
+    echo "FATAL: 'bd ready --json' failed, or returned a shape ids.py does not"
+    echo "       understand, so an empty queue cannot be trusted. Refusing to"
+    echo "       run triage -- it would file beads over a queue that may well"
+    echo "       exist. Fix bd (or ids.py), then re-run."
     exit 1
   }
   [ -z "$(next_ready)" ] && [ -z "$(next_stale)" ]
@@ -194,6 +198,12 @@ fi
 last_id=""
 attempts=0
 workers=0
+
+# Consecutive workers that died too fast to have attempted their bead. See the
+# fast-failure block at the bottom of the loop for what this is defending
+# against.
+fast_failures=0
+aborted=""
 
 while :; do
   TASK_ID="$(next_ready)"
@@ -237,6 +247,7 @@ while :; do
 
   echo "==> worker $workers: $TASK_ID (attempt $attempts)"
 
+  started_at="$(date +%s)"
   run_worker "$(cat "$PROMPT_FILE")
 
 ---
@@ -268,7 +279,49 @@ A session that dies after closing and before writing leaves no trace of how
 the work was done; one that dies the other way round is merely unfinished."
 
   status=$?
-  [ "$status" -ne 0 ] && echo "==> worker exited $status"
+  elapsed=$(( $(date +%s) - started_at ))
+  [ "$status" -ne 0 ] && echo "==> worker exited $status after ${elapsed}s"
+
+  # A worker cannot fail a bead in seconds. It has to read the bead, look at
+  # the repo, and try something; the floor on that is minutes. So a non-zero
+  # exit inside MIN_WORKER_SECONDS did not come from the work -- it is a usage
+  # or rate limit, an expired CLAUDE_CODE_OAUTH_TOKEN, or a proxy that died
+  # mid-run. The loop cannot tell those apart, and it does not need to: what it
+  # must not do is charge them to the bead.
+  #
+  # Without this, a rate limit drains the whole queue in under a minute.
+  # MAX_ATTEMPTS defaults to 2, so each bead is dispatched, dies instantly,
+  # is re-dispatched, dies again, and is PARKED -- and the run reports a queue
+  # of beads that "came back unfinished twice", which reads as hard work rather
+  # than a dead credential. This is the same failure check_proxy() exists to
+  # prevent at startup, arriving mid-run instead.
+  #
+  # One fast failure gets a short wait and a free retry: transient things
+  # happen, and the bead did nothing wrong. Two in a row is not transient, and
+  # the run stops rather than guessing at a limit window whose length nobody
+  # here knows.
+  if [ "$status" -ne 0 ] && [ "$elapsed" -lt "$MIN_WORKER_SECONDS" ]; then
+    fast_failures=$((fast_failures + 1))
+    # Not the bead's fault, so it must not carry the attempt: reset the
+    # livelock counter, or two rate-limited dispatches park a healthy bead.
+    last_id=""
+    attempts=0
+    if [ "$fast_failures" -ge 2 ]; then
+      aborted="two workers in a row exited in under ${MIN_WORKER_SECONDS}s"
+      echo "==> ABORT: $aborted."
+      echo "    That is too fast to be the bead. Usual causes, in order:"
+      echo "      * a usage or rate limit on the account behind CLAUDE_CODE_OAUTH_TOKEN"
+      echo "      * that token expired or revoked"
+      echo "      * the proxy at ANTHROPIC_BASE_URL died after the startup check"
+      echo "    No bead was parked and nothing was charged against MAX_ATTEMPTS."
+      echo "    $TASK_ID is still claimed; re-running picks it up as a stale claim."
+      break
+    fi
+    echo "==> not counting that against $TASK_ID; retrying in ${FAST_FAIL_SLEEP}s"
+    sleep "$FAST_FAIL_SLEEP"
+    continue
+  fi
+  fast_failures=0
 done
 
 stranded="$(ids_by_status in_progress)"
@@ -280,6 +333,16 @@ echo "Open beads: $(printf '%s' "$open_left" | wc -w | tr -d ' ')"
 echo "Nothing was committed or pushed. Review with: git status && git diff"
 
 exit_code=0
+
+# An infrastructure abort must never look like a clean drain. The queue was not
+# emptied; the run was stopped, and the open beads printed above are untouched
+# work, not leftovers.
+if [ -n "$aborted" ]; then
+  echo
+  echo "RUN STOPPED: $aborted."
+  echo "  Fix the cause above, then re-run -- claimed beads come back as stale claims."
+  exit_code=1
+fi
 
 # Only the ones this run actually gave up on. A bead from `park` was never
 # dispatched, so reporting it as "tried twice and failed" would be a lie, and

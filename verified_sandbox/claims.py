@@ -1,6 +1,6 @@
 """Cross-machine bead claims, as refs on the git remote (verified-sandbox-4z7).
 
-    python3 claims.py take REMOTE ID ACTOR LEASE_SECONDS   # exit 0 won, 1 lost
+    python3 claims.py take REMOTE ID ACTOR LEASE_SECONDS   # exit 0 won, 1 lost, 2 error
     python3 claims.py release REMOTE ID                     # exit 0 released
     python3 claims.py held REMOTE ACTOR LEASE_SECONDS       # ids live-claimed by others
 
@@ -68,8 +68,16 @@ def take(remote, id_, actor, lease):
     else:
         lease_flag = []   # a plain push refuses to create a ref that exists
     sha = new_claim_commit(id_, actor)
-    if git("push", "-q", *lease_flag, remote, f"{sha}:{PREFIX}{id_}", check=False).returncode:
-        return 1
+    pushed = git("push", "-q", *lease_flag, remote, f"{sha}:{PREFIX}{id_}", check=False)
+    if pushed.returncode:
+        # Lost the race only if the ref actually moved. Anything else -- a
+        # proxy refusing refs/claims/* (a cloud session's git proxy answers
+        # 403), no network, no auth -- must not read as "taken": the caller
+        # would skip every bead in turn and report the whole queue as busy.
+        if remote_claims(remote).get(id_) not in (None, current):
+            return 1
+        print(f"claims: could not push {PREFIX}{id_}: {pushed.stderr.strip()}", file=sys.stderr)
+        return 2
     git("update-ref", MINE + id_, sha)
     return 0
 

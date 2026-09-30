@@ -212,3 +212,16 @@ def test_real_bd_cannot_merge_two_edits_to_one_bead(tmp_path):
     assert _bd(a, "dolt", "push").returncode == 0
     pulled = _bd(c, "dolt", "pull")
     assert pulled.returncode != 0 and "conflict" in (pulled.stdout + pulled.stderr)
+
+
+def test_a_refused_push_is_an_error_not_a_lost_race(tmp_path):
+    # A cloud session's git proxy answered 403 to refs/claims/*, and take
+    # reported "someone else holds it" -- so every bead looked taken. A
+    # pre-receive hook stands in for the proxy.
+    remote, (a,) = _remote_and_clones(tmp_path, "a")
+    hook = remote / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\necho 'proxy: refs/claims/* not allowed' >&2\nexit 1\n")
+    hook.chmod(0o755)
+    got = _claims(a, "take", "origin", "t-1", "a", "3600")
+    assert got.returncode == 2, (got.returncode, got.stderr)
+    assert "not allowed" in got.stderr

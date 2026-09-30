@@ -139,9 +139,30 @@ bd dolt pull && bd dolt push        # publish first
 python3 claims.py release origin chem-abc
 ```
 
-`take` exits 0 on a win and 1 when someone else holds a live claim. The Dolt
-remote must be reachable from the session: a `git+ssh://` remote needs SSH
-access to the host, which some cloud sessions lack.
+`take` exits 0 on a win, 1 when someone else holds a live claim, and 2 when
+the push itself failed (auth, network, a proxy) — stop on 2, do not move on.
+
+Use the same bd as the machines you share with (the images pin 1.1.2): a newer
+bd migrates the database schema on bootstrap, and pushing that to
+`refs/dolt/data` can leave older clients unable to read it.
+
+### Claude Code cloud (and phone) sessions
+
+These can read everything but, as of 2026-09-30, their git proxy refuses
+pushes to `refs/claims/*` (HTTP 403) and so almost certainly to
+`refs/dolt/data`: they can neither claim nor publish bead state. Bootstrap
+works (reads go through). The pattern that does work: claim **on the
+session's behalf** from a machine that can push, and let the session only do
+the code.
+
+```bash
+# on the laptop
+python3 claims.py take origin chem-abc phone@cloud 86400
+# in the cloud session: bd show chem-abc for the spec, work on a branch, push it
+# back on the laptop, after reviewing and merging that branch
+bd close chem-abc && bd dolt pull && bd dolt push
+python3 claims.py release origin chem-abc     # the laptop took it, so it can
+```
 
 ## What `install-hooks` does
 

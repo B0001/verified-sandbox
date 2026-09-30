@@ -23,6 +23,7 @@ image = "claude"
 max-attempts = 2                       # same bead unclosed this often -> park it
 max-workers = 25                       # backstop against a runaway queue
 max-parallel = 1                       # workers at once; >1 = one worktree each
+shared-queue = ""                      # git remote refereeing claims across machines
 prompt-file = "sandbox-prompt.md"
 handoff-dir = "sandbox-handoffs"
 volumes = []                           # extra named volumes, "name:/path"
@@ -93,6 +94,54 @@ Things to know:
   worker merging.
 - A run killed hard (not Ctrl-C) can leave worktrees behind; the next run
   lists them and refuses to start until they are removed.
+
+## Shared queue (several machines, one queue)
+
+```toml
+[tool.sandbox]
+shared-queue = "origin"      # git remote that referees claims; unset = off
+claim-lease-hours = 24       # a claim older than this can be taken over
+```
+
+For draining one repo's beads from more than one place — two laptops, or a
+laptop and a cloud/phone session. Bead state travels through bd's Dolt remote
+(`bd dolt pull` / `bd dolt push`, `refs/dolt/data`); who works which bead is
+settled by a claim ref on the git remote, `refs/claims/<bead-id>`, taken
+before anyone touches the bead. Creating a ref is atomic, so exactly one
+machine wins each race; the loser picks another bead.
+
+Claims exist because embedded bd cannot merge two edits to the same issue:
+the second `bd dolt pull` aborts with "merge conflicts in issues require
+operator resolution", and there is no embedded-mode way to resolve it. Edits
+to different issues merge cleanly. `VS_BD_TESTS=1` runs the tests that pin
+both facts against the real bd.
+
+With `shared-queue` set, the loop pulls before choosing, skips beads another
+machine holds, claims its choice, and after each worker pushes the bead's
+state *then* releases the claim — in that order, so no one can claim a bead
+whose close has not been published. A claim's lease has no heartbeat: set it
+above your longest bead (a chem bead has run 8.5 h).
+
+### Working a bead by hand (a cloud or phone session)
+
+A Claude session that is not the loop follows the same protocol. From the
+repo root, with `bd` installed and `claims.py` from this package:
+
+```bash
+bd bootstrap --yes                  # fresh clone: pull the bead database
+bd dolt pull
+bd ready                            # pick one, say chem-abc
+python3 claims.py take origin chem-abc "$(whoami)@cloud" 86400 || echo "taken; pick another"
+bd dolt pull && bd show chem-abc    # still open? (someone may have just closed it)
+bd update chem-abc --claim
+# ... work, commit on a branch, bd close chem-abc ...
+bd dolt pull && bd dolt push        # publish first
+python3 claims.py release origin chem-abc
+```
+
+`take` exits 0 on a win and 1 when someone else holds a live claim. The Dolt
+remote must be reachable from the session: a `git+ssh://` remote needs SSH
+access to the host, which some cloud sessions lack.
 
 ## What `install-hooks` does
 

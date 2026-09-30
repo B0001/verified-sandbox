@@ -33,6 +33,7 @@ source "$SANDBOX_CONF"   # DOCKER_ARGS, IMAGE, MAX_ATTEMPTS, MAX_WORKERS, PROMPT
                          # HANDOFF_DIR, MIN_WORKER_SECONDS, FAST_FAIL_SLEEP,
                          # SANDBOX_AUTHOR_NAME, SANDBOX_AUTHOR_EMAIL, MAX_PARALLEL
 MAX_PARALLEL="${MAX_PARALLEL:-1}"
+SHARED_REMOTE="${SHARED_REMOTE:-}" CLAIM_LEASE="${CLAIM_LEASE:-86400}" CLAIM_ACTOR="${CLAIM_ACTOR:-sandbox}"
 
 LOCK_DIR=".sandbox.lock"
 
@@ -164,7 +165,10 @@ next bead's branch. Review before merging." || {
 # dispatches the next worker. You cannot interrupt the loop, and every Ctrl-C
 # burns an attempt until MAX_ATTEMPTS parks a bead that was never actually
 # tried. The trap fires once the foreground docker returns, which is enough.
-trap 'echo; echo "==> interrupted; stopping."; leave_branch; exit 130' INT
+trap 'echo; echo "==> interrupted; stopping."
+      b="$CURRENT_BRANCH"; leave_branch
+      case "$b" in "") ;; sandbox/triage-*) shared_done _triage ;; *) shared_done "${b#sandbox/}" ;; esac
+      exit 130' INT
 
 # Docker initialises a named volume root-owned when its mount path doesn't
 # already exist in the image, so the two uv volumes come up as root:root and
@@ -303,6 +307,10 @@ is_parked() { case " $PARKED " in *" $1 "*) return 0;; *) return 1;; esac; }
 INFLIGHT=""
 is_inflight() { case " $INFLIGHT " in *" $1 "*) return 0;; *) return 1;; esac; }
 
+# Beads another machine holds a live claim on (shared queue only).
+ELSEWHERE=""
+is_elsewhere() { case " $ELSEWHERE " in *" $1 "*) return 0;; *) return 1;; esac; }
+
 # Shape handling and the id extraction live in ids.py, so a change in bd's
 # --json envelope is one edit rather than three, and is testable. It exits
 # nonzero on a shape it does not recognise; pipefail carries that out of these
@@ -337,6 +345,7 @@ first_unparked() {
   for id in $1; do
     is_parked "$id" && continue
     is_inflight "$id" && continue
+    is_elsewhere "$id" && continue
     echo "$id"
     return
   done
@@ -379,10 +388,99 @@ queue_empty() {
   [ -z "$(next_ready)" ] && [ -z "$(next_stale)" ]
 }
 
+# --- shared queue (shared-queue = "<git remote>", verified-sandbox-4z7) -----
+# Several machines draining one queue: this loop on two laptops, or a laptop
+# and a cloud session. Bead state travels through the Dolt remote (bd dolt
+# pull/push). WHO works which bead is settled by claims.py on the git remote,
+# before anyone edits the bead: embedded bd cannot resolve a pull in which
+# both sides edited the same issue, so that must never happen.
+#
+# The one ordering rule: a machine pushes a bead's state BEFORE releasing its
+# claim. So a claim won just after someone else finished that bead is caught
+# by the pull that follows winning it.
+CLAIMS="$(dirname "$0")/claims.py"
+claims() { python3 "$CLAIMS" "$@"; }
+
+shared_pull() {
+  local err
+  bd dolt commit -m "sandbox: local changes before pull" >/dev/null 2>&1
+  err="$(bd dolt pull 2>&1)" && return 0
+  echo "==> ABORT: bd dolt pull failed, so this machine cannot see the shared queue:"
+  printf '%s\n' "$err" | tail -3 | sed 's/^/    /'
+  return 1
+}
+
+# Publish bead $1's state, then give up its claim -- in that order.
+shared_done() {
+  [ -n "$SHARED_REMOTE" ] || return 0
+  local try
+  for try in 1 2 3; do
+    if shared_pull >/dev/null && bd dolt push >/dev/null 2>&1; then
+      claims release "$SHARED_REMOTE" "$1" ||
+        echo "==> note: the claim on $1 was no longer ours to release (lease ran out?)"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "==> ABORT: could not push $1's state to the Dolt remote. Its claim is kept so"
+  echo "    no other machine redoes it. Push by hand (bd dolt pull && bd dolt push),"
+  echo "    then: python3 $CLAIMS release $SHARED_REMOTE $1"
+  return 1
+}
+
+# Give back a claim on a bead that was never worked (parked, or not started).
+shared_release() {
+  [ -n "$SHARED_REMOTE" ] && claims release "$SHARED_REMOTE" "$1"
+  return 0
+}
+
+# Choose the next bead into TASK_ID ("" when there is none): ready work first,
+# then stale claims. With a shared queue: sync, skip beads other machines hold,
+# claim the choice on the remote, and pick again on losing that race.
+pick_task() {
+  local rc
+  if [ -n "$SHARED_REMOTE" ]; then
+    shared_pull || return 1
+    ELSEWHERE="$(claims held "$SHARED_REMOTE" "$CLAIM_ACTOR" "$CLAIM_LEASE" | tr '\n' ' ')"
+  fi
+  while :; do
+    TASK_ID="$(next_ready)"
+    if [ -z "$TASK_ID" ]; then
+      TASK_ID="$(next_stale)"
+      if [ -n "$TASK_ID" ]; then
+        echo "==> nothing ready; re-dispatching stale claim: $TASK_ID"
+      fi
+    fi
+    [ -n "$TASK_ID" ] && [ -n "$SHARED_REMOTE" ] || return 0
+    claims take "$SHARED_REMOTE" "$TASK_ID" "$CLAIM_ACTOR" "$CLAIM_LEASE"
+    rc=$?
+    [ "$rc" -le 1 ] || return 1
+    if [ "$rc" -eq 0 ]; then
+      shared_pull || return 1
+      case " $(ready_ids) $(stale_ids) " in *" $TASK_ID "*) return 0 ;; esac
+      claims release "$SHARED_REMOTE" "$TASK_ID"
+      echo "==> $TASK_ID was finished by another machine; picking another"
+    else
+      echo "==> $TASK_ID was just claimed by another machine; picking another"
+    fi
+    ELSEWHERE="$ELSEWHERE $TASK_ID"
+  done
+}
+
 # Empty queue on the first pass means the phase has not been triaged yet, not
 # that the work is done. Seed it: one worker that files beads and writes no
 # code.
+[ -z "$SHARED_REMOTE" ] || shared_pull || exit 1
 if queue_empty; then
+  if [ -n "$SHARED_REMOTE" ]; then
+    # Two machines seeing the same empty queue must not both file one.
+    claims take "$SHARED_REMOTE" _triage "$CLAIM_ACTOR" "$CLAIM_LEASE"
+    case $? in
+      0) ;;
+      1) echo "==> queue empty and another machine is triaging it; nothing to do."; exit 0 ;;
+      *) echo "==> ABORT: could not reach $SHARED_REMOTE to claim triage."; exit 1 ;;
+    esac
+  fi
   echo "==> queue empty; running triage pass to file beads"
   triage_branch="sandbox/triage-$(date +%Y%m%d-%H%M%S)"
   triage_prompt="$(cat "$PROMPT_FILE")
@@ -413,11 +511,13 @@ Leave every bead open and unclaimed. Then stop and report the list."
     # A trapped signal cuts `wait` short; the second one waits for docker to go.
     wait "$STARTED_PID"; wait "$STARTED_PID" 2>/dev/null
     wt_finish "$triage_branch" || exit 1
+    shared_done _triage || exit 1
     [ -n "$triage_int" ] && { echo "==> interrupted; stopping."; exit 130; }
   else
     enter_branch "$triage_branch" || exit 1
     run_worker "$triage_prompt"
     leave_branch || exit 1
+    shared_done _triage || exit 1
   fi
   echo "==> triage complete"
 fi
@@ -496,6 +596,7 @@ if [ "$MAX_PARALLEL" -gt 1 ]; then
     INFLIGHT="$(printf '%s\n' $INFLIGHT | grep -vx "$id" | tr '\n' ' ')"
     echo "==> $id: worker exited $2 after ${elapsed}s"
     wt_finish "sandbox/$id" || { aborted="the worktree for $id was not safe to remove"; stop=1; }
+    shared_done "$id" || { aborted="could not publish $id's bead state"; stop=1; }
     if [ "$(protected_refs)" != "$REFS_BEFORE" ]; then
       echo "==> ABORT: a branch outside sandbox/ moved while workers ran."
       echo "    Workers never merge. Before vs after:"
@@ -538,11 +639,7 @@ if [ "$MAX_PARALLEL" -gt 1 ]; then
       [ -z "${SLOT_PID[i]}" ] && { free=$i; break; }
     done
     if [ -z "$stop" ] && [ -n "$free" ] && [ "$(date +%s)" -ge "$hold_until" ]; then
-      TASK_ID="$(next_ready)"
-      if [ -z "$TASK_ID" ]; then
-        TASK_ID="$(next_stale)"
-        [ -n "$TASK_ID" ] && echo "==> nothing ready; re-dispatching stale claim: $TASK_ID"
-      fi
+      pick_task || { aborted="the shared queue could not be synced"; stop=1; continue; }
       if [ -z "$TASK_ID" ]; then
         if [ "$running" -eq 0 ]; then
           echo "==> queue drained after $workers worker(s)"
@@ -553,11 +650,13 @@ if [ "$MAX_PARALLEL" -gt 1 ]; then
         echo "    Inspect with: bd show $TASK_ID"
         echo "    Its branch and handoff (if any): git show sandbox/$TASK_ID:$HANDOFF_DIR/$TASK_ID.md"
         PARKED="$PARKED $TASK_ID"
+        shared_release "$TASK_ID"
         continue
       else
         workers=$((workers + 1))
         if [ "$workers" -gt "$MAX_WORKERS" ]; then
           echo "==> ABORT: hit MAX_WORKERS=$MAX_WORKERS. Queue is growing, not draining."
+          shared_release "$TASK_ID"
           stop=1
           continue
         fi
@@ -565,6 +664,7 @@ if [ "$MAX_PARALLEL" -gt 1 ]; then
         echo "    log: $WT_DIR/$TASK_ID.log"
         if ! wt_start "sandbox/$TASK_ID" "$(bead_prompt "$TASK_ID")"; then
           aborted="could not start a worktree for $TASK_ID"
+          shared_release "$TASK_ID"
           stop=1
           continue
         fi
@@ -583,14 +683,7 @@ fi
 
 # Sequential runs (the default). Skipped entirely when the block above ran.
 while [ "$MAX_PARALLEL" -le 1 ]; do
-  TASK_ID="$(next_ready)"
-
-  if [ -z "$TASK_ID" ]; then
-    TASK_ID="$(next_stale)"
-    if [ -n "$TASK_ID" ]; then
-      echo "==> nothing ready; re-dispatching stale claim: $TASK_ID"
-    fi
-  fi
+  pick_task || { aborted="the shared queue could not be synced"; break; }
 
   if [ -z "$TASK_ID" ]; then
     echo "==> queue drained after $workers worker(s)"
@@ -611,6 +704,7 @@ while [ "$MAX_PARALLEL" -le 1 ]; do
     echo "    Inspect with: bd show $TASK_ID"
     echo "    Its branch and handoff (if any): git show sandbox/$TASK_ID:$HANDOFF_DIR/$TASK_ID.md"
     PARKED="$PARKED $TASK_ID"
+    shared_release "$TASK_ID"
     last_id=""
     attempts=0
     continue
@@ -619,18 +713,22 @@ while [ "$MAX_PARALLEL" -le 1 ]; do
   workers=$((workers + 1))
   if [ "$workers" -gt "$MAX_WORKERS" ]; then
     echo "==> ABORT: hit MAX_WORKERS=$MAX_WORKERS. Queue is growing, not draining."
+    shared_release "$TASK_ID"
     break
   fi
 
   echo "==> worker $workers: $TASK_ID (attempt $attempts)"
 
-  enter_branch "sandbox/$TASK_ID" || { aborted="could not branch for $TASK_ID"; break; }
+  enter_branch "sandbox/$TASK_ID" || {
+    aborted="could not branch for $TASK_ID"; shared_release "$TASK_ID"; break
+  }
   started_at="$(date +%s)"
   run_worker "$(bead_prompt "$TASK_ID")"
 
   status=$?
   elapsed=$(( $(date +%s) - started_at ))
   leave_branch || { aborted="the tree was not safe to hand to the next worker"; break; }
+  shared_done "$TASK_ID" || { aborted="could not publish $TASK_ID's bead state"; break; }
   [ "$status" -ne 0 ] && echo "==> worker exited $status after ${elapsed}s"
 
   # A worker cannot fail a bead in seconds. It has to read the bead, look at

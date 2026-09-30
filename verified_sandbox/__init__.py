@@ -176,6 +176,11 @@ def conf_text(root, cfg):
         # Workers running at once, each in its own git worktree. 1 is the
         # original loop, byte for byte: one worker, in the repo's own tree.
         f"MAX_PARALLEL={max(1, int(cfg.get('max-parallel', 1)))}",
+        # Shared queue (verified-sandbox-4z7): the git remote that referees
+        # claims between machines draining the same beads. Empty = off.
+        f"SHARED_REMOTE={shlex.quote(cfg.get('shared-queue', ''))}",
+        f"CLAIM_LEASE={int(float(cfg.get('claim-lease-hours', 24)) * 3600)}",
+        f"CLAIM_ACTOR={shlex.quote('sandbox@' + socket.gethostname().split('.')[0])}",
         # A non-zero worker exit inside this many seconds is treated as
         # infrastructure (rate limit, dead token, dead proxy), not as the bead
         # failing -- see the fast-failure block in loop.sh. The floor for a

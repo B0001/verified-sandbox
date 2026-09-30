@@ -289,15 +289,17 @@ def test_ids_refuses_an_unknown_shape_rather_than_reporting_an_empty_queue():
 
 
 def _fake_run(tmp_path, docker_exit, docker_sleep=0, max_attempts=2, min_worker_seconds=90,
-              queue=("t-1",), worker="", dirty_start=False):
+              queue=("t-1",), worker="", dirty_start=False, max_parallel=1,
+              bd_export_dirty=False):
     """Drive the real loop.sh against a fake `bd` and a fake `docker`, in a real
     git repo with the real hooks installed.
 
     The rate-limit and branch-per-bead behaviour live in the loop, not in
     Python, so nothing short of running it actually checks them. `worker` is
     shell run in place of the container, in the repo, with $ID set to the bead
-    it was dispatched on; a worker that removes $ID from $FAKE_QUEUE has
-    closed its bead.
+    it was dispatched on; a worker that runs CLOSE has closed its bead. With
+    max_parallel > 1 the worker runs in the worktree the loop mounted as its
+    /workspace, and $HOST_REPO / $SYNC are there for the parallel tests.
     """
     import os
     bin_dir = tmp_path / "bin"
@@ -308,6 +310,7 @@ def _fake_run(tmp_path, docker_exit, docker_sleep=0, max_attempts=2, min_worker_
         '  "ready --json")\n'
         '    printf \'{"data":[\'; sep=\n'
         '    for i in $(cat "$FAKE_QUEUE"); do\n'
+        '      [ -e "$FAKE_QUEUE.closed/$i" ] && continue\n'
         '      printf \'%s{"id":"%s","issue_type":"task"}\' "$sep" "$i"; sep=,\n'
         '    done; echo "]}" ;;\n'
         '  *) echo \'{"data":[]}\' ;;\n'
@@ -320,6 +323,8 @@ def _fake_run(tmp_path, docker_exit, docker_sleep=0, max_attempts=2, min_worker_
         'for a in "$@"; do case "$a" in *"YOUR TASK THIS SESSION: bead "*)\n'
         '  ID="$(printf "%s" "$a" | sed -n "s/.*YOUR TASK THIS SESSION: bead //p" | head -1)";;\n'
         'esac; done\n'
+        # Run where the real container would: in whatever the loop mounted.
+        'for a in "$@"; do case "$a" in *:/workspace) cd "${a%:/workspace}" || exit 99;; esac; done\n'
         'export BEADS_ACTOR=sandbox GIT_AUTHOR_NAME=sandbox GIT_AUTHOR_EMAIL=s@s\n'
         'export GIT_COMMITTER_NAME=sandbox GIT_COMMITTER_EMAIL=s@s\n'
         f'{worker}\n'
@@ -335,14 +340,21 @@ def _fake_run(tmp_path, docker_exit, docker_sleep=0, max_attempts=2, min_worker_
     repo = _git_repo(tmp_path / "repo")
     (repo / "prompt.md").write_text("standing context")
     vs.cmd_install_hooks(repo)
+    if bd_export_dirty:
+        (repo / ".beads" / "interactions.jsonl").write_text("{}\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "init")
     if dirty_start:
         (repo / "stray.txt").write_text("host edit nobody committed")
+    if bd_export_dirty:
+        with open(repo / ".beads" / "interactions.jsonl", "a") as fh:
+            fh.write("{}\n")
 
     conf = tmp_path / "conf.sh"
+    mount = f" -v {shlex.quote(str(repo))}:/workspace" if max_parallel > 1 else ""
     conf.write_text(
-        "DOCKER_ARGS=(--rm)\nCHOWN_VOLUMES=(uv-cache)\nPARK_ALWAYS=\nIMAGE=fake\n"
+        f"DOCKER_ARGS=(--rm{mount})\nCHOWN_VOLUMES=(uv-cache)\nPARK_ALWAYS=\nIMAGE=fake\n"
+        f"MAX_PARALLEL={max_parallel}\n"
         f"MAX_ATTEMPTS={max_attempts}\nMAX_WORKERS=25\n"
         "PROMPT_FILE=prompt.md\nHANDOFF_DIR=handoffs\n"
         f"MIN_WORKER_SECONDS={min_worker_seconds}\nFAST_FAIL_SLEEP=1\n"
@@ -352,7 +364,8 @@ def _fake_run(tmp_path, docker_exit, docker_sleep=0, max_attempts=2, min_worker_
     out = subprocess.run(
         ["bash", str(loop)], cwd=repo, capture_output=True, text=True, timeout=120,
         env={**os.environ, **HOST_IDENTITY, "SANDBOX_CONF": str(conf),
-             "FAKE_QUEUE": str(fake_queue),
+             "FAKE_QUEUE": str(fake_queue), "HOST_REPO": str(repo),
+             "SYNC": str(tmp_path / "sync"),
              "PATH": f"{bin_dir}:{os.environ['PATH']}"},
     )
     out.repo = repo
@@ -478,7 +491,9 @@ def test_workers_get_a_git_identity():
     assert "GIT_CONFIG_KEY_0=safe.directory" in args and "GIT_CONFIG_VALUE_0=/workspace" in args
 
 
-CLOSE = 'grep -vx "$ID" "$FAKE_QUEUE" > "$FAKE_QUEUE.new"; mv "$FAKE_QUEUE.new" "$FAKE_QUEUE"\n'
+# A marker file per closed bead, not a rewrite of the queue: two parallel
+# workers closing at once would lose one of the rewrites.
+CLOSE = 'mkdir -p "$FAKE_QUEUE.closed" && touch "$FAKE_QUEUE.closed/$ID"\n'
 
 
 def _changed(repo, branch):

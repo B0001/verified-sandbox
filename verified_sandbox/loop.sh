@@ -31,7 +31,8 @@ set -uo pipefail
 # shellcheck disable=SC1090
 source "$SANDBOX_CONF"   # DOCKER_ARGS, IMAGE, MAX_ATTEMPTS, MAX_WORKERS, PROMPT_FILE,
                          # HANDOFF_DIR, MIN_WORKER_SECONDS, FAST_FAIL_SLEEP,
-                         # SANDBOX_AUTHOR_NAME, SANDBOX_AUTHOR_EMAIL
+                         # SANDBOX_AUTHOR_NAME, SANDBOX_AUTHOR_EMAIL, MAX_PARALLEL
+MAX_PARALLEL="${MAX_PARALLEL:-1}"
 
 LOCK_DIR=".sandbox.lock"
 
@@ -68,7 +69,19 @@ case "$BASE" in
     echo "       Check out the base branch (e.g. main), then re-run."
     exit 1 ;;
 esac
-if [ -n "$(git status --porcelain)" ]; then
+# bd's own exports are exempt in a parallel run: its workers' bd calls write
+# them in THIS tree, where the shared database lives, so every parallel run
+# ends with them modified -- and would otherwise refuse to start the next.
+# A worktree branches from $BASE's commit, so they are never swept anywhere.
+BD_EXPORTS='^ M \.beads/(issues|interactions)\.jsonl$'
+host_dirt() {
+  if [ "$MAX_PARALLEL" -gt 1 ]; then
+    git status --porcelain | grep -vE "$BD_EXPORTS"
+  else
+    git status --porcelain
+  fi
+}
+if [ -n "$(host_dirt)" ]; then
   echo "FATAL: the working tree is dirty. Every bead branches from $BASE, so these"
   echo "       changes would be swept into the first bead's branch. Commit or"
   echo "       stash them, then re-run."
@@ -117,24 +130,32 @@ leave_branch() {
     echo "    Nothing was committed or switched; inspect by hand."
     return 1
   fi
-  if [ -n "$(git status --porcelain)" ]; then
-    echo "==> worker left uncommitted changes; committing them to $b as WIP"
-    git add -A &&
-      GIT_AUTHOR_NAME="$SANDBOX_AUTHOR_NAME" GIT_AUTHOR_EMAIL="$SANDBOX_AUTHOR_EMAIL" \
-      git commit -q -m "WIP ($b): uncommitted changes the worker left behind
+  commit_leftovers "$b" || {
+    echo "    The tree is still on $b, dirty. Resolve it, then check out $BASE."
+    return 1
+  }
+  git checkout -q "$BASE" || { echo "==> ABORT: could not return to $BASE."; return 1; }
+}
+
+# Commit whatever the worker on branch $1 left uncommitted in the current
+# directory onto $1 itself, as WIP, so it is neither lost nor carried onto the
+# next bead's branch.
+commit_leftovers() {
+  [ -n "$(git status --porcelain)" ] || return 0
+  echo "==> worker left uncommitted changes; committing them to $1 as WIP"
+  git add -A &&
+    GIT_AUTHOR_NAME="$SANDBOX_AUTHOR_NAME" GIT_AUTHOR_EMAIL="$SANDBOX_AUTHOR_EMAIL" \
+    git commit -q -m "WIP ($1): uncommitted changes the worker left behind
 
 Committed by the sandbox loop so they are neither lost nor carried onto the
 next bead's branch. Review before merging." || {
-        echo "==> ABORT: could not commit the leftovers on $b (a hook refused?)."
-        echo "    The tree is still on $b, dirty. Resolve it, then check out $BASE."
-        return 1
-      }
-    if [ -n "$(git status --porcelain)" ]; then
-      echo "==> ABORT: $b is still dirty after the WIP commit (a hook wrote files?)."
+      echo "==> ABORT: could not commit the leftovers on $1 (a hook refused?)."
       return 1
-    fi
+    }
+  if [ -n "$(git status --porcelain)" ]; then
+    echo "==> ABORT: $1 is still dirty after the WIP commit (a hook wrote files?)."
+    return 1
   fi
-  git checkout -q "$BASE" || { echo "==> ABORT: could not return to $BASE."; return 1; }
 }
 
 # Ctrl-C must stop the RUN, not just the worker. `docker run -it` forwards the
@@ -172,6 +193,83 @@ run_worker() {
     -p "$1" --dangerously-skip-permissions
 }
 
+# --- parallel runs (max-parallel > 1, verified-sandbox-ihq) -----------------
+# Each worker gets its own git worktree under .git/sandbox-worktrees/, on its
+# own sandbox/<bead-id> branch, mounted as its /workspace. The host tree never
+# leaves $BASE, so nothing is checked out underneath you mid-run.
+#
+# A worktree's .git file points at the main repo's .git by absolute host path,
+# and bd finds the shared database through it (git's common dir -> .beads/).
+# So the container also gets the main .git and .beads mounted at their HOST
+# paths; without them git inside the worktree is broken and bd finds no
+# database. Every bd call, host and container, goes through bdlock/bd.
+if [ "$MAX_PARALLEL" -gt 1 ]; then
+  ROOT="$(pwd -P)"
+  GIT_COMMON="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)"
+  WT_DIR="$GIT_COMMON/sandbox-worktrees"
+  BD_SHIM_DIR="$(cd "$(dirname "$0")/bdlock" && pwd -P)"
+  export BD_LOCK_DIR="$ROOT/.beads/.bd-lock"
+  export PATH="$BD_SHIM_DIR:$PATH"   # git hooks the loop triggers call bd too
+  git worktree prune
+  if git worktree list --porcelain | grep -q "^worktree $WT_DIR/"; then
+    echo "FATAL: worktrees from an earlier run are still registered:"
+    git worktree list | grep "$WT_DIR/" | sed 's/^/    /'
+    echo "       Their branches keep any committed work. Commit or discard what is"
+    echo "       left in each, then: git worktree remove <path>"
+    exit 1
+  fi
+  mkdir -p "$WT_DIR"
+fi
+
+# Start a worker on branch $1 in its own worktree, in the background, output to
+# $WT_DIR/<name>.log. Sets STARTED_PID.
+wt_start() {
+  local b="$1" name="${1#sandbox/}" wt a args=()
+  wt="$WT_DIR/$name"
+  if git show-ref --verify -q "refs/heads/$b"; then
+    git worktree add -q "$wt" "$b"
+  else
+    git worktree add -q -b "$b" "$wt" "$BASE"
+  fi || {
+    echo "==> ABORT: could not create a worktree for $b."
+    # No worker has run in it, so there is nothing to keep -- and a half-made
+    # one (a Ctrl-C landing mid-`worktree add`) would block the next run.
+    git worktree remove --force "$wt" 2>/dev/null
+    git worktree prune
+    return 1
+  }
+  for a in "${DOCKER_ARGS[@]}"; do
+    case "$a" in *:/workspace) a="$wt:/workspace" ;; esac
+    args+=("$a")
+  done
+  # No -it: N workers cannot share one terminal. Ctrl-C is handled by the
+  # trap below, since a script's background jobs ignore SIGINT. The last
+  # GIT_CONFIG_VALUE_0 wins: git checks the worktree's gitdir too, and that is
+  # a host path, not /workspace.
+  docker run --rm --init "${args[@]}" \
+    -v "$GIT_COMMON:$GIT_COMMON" -v "$ROOT/.beads:$ROOT/.beads" \
+    -v "$BD_SHIM_DIR/bd:/usr/local/sbin/bd:ro" -e BD_LOCK_DIR \
+    -e "GIT_CONFIG_VALUE_0=*" \
+    "$IMAGE" -p "$2" --dangerously-skip-permissions \
+    </dev/null >>"$WT_DIR/$name.log" 2>&1 &
+  STARTED_PID=$!
+}
+
+# After the worker on branch $1 exits: commit its leftovers as WIP, then remove
+# its worktree. The branch keeps the work. On any surprise the worktree is left
+# in place for a human.
+wt_finish() {
+  local b="$1" wt="$WT_DIR/${1#sandbox/}" now
+  now="$(git -C "$wt" symbolic-ref --short -q HEAD)"
+  if [ "$now" != "$b" ]; then
+    echo "==> ABORT: the worker on $b left HEAD on '${now:-detached HEAD}'."
+    echo "    Its worktree is left in place: $wt"
+    return 1
+  fi
+  (cd "$wt" && commit_leftovers "$b") || { echo "    Worktree left in place: $wt"; return 1; }
+  git worktree remove --force "$wt" || { echo "==> ABORT: could not remove $wt."; return 1; }
+}
+
 # Appended to every worker prompt. Repo prompts written before branch-per-bead
 # say "do not commit"; this says which rule wins, so a worker is not left
 # choosing between two instructions.
@@ -198,6 +296,12 @@ committed for you as WIP, which is worse for your reviewer than a real message."
 PARKED="$PARK_ALWAYS"
 
 is_parked() { case " $PARKED " in *" $1 "*) return 0;; *) return 1;; esac; }
+
+# Beads a worker is on right now (parallel runs only). A dispatched bead stays
+# in `bd ready` until its worker gets round to claiming it, and in the stale
+# list for as long as it runs, so without this the next free slot takes it too.
+INFLIGHT=""
+is_inflight() { case " $INFLIGHT " in *" $1 "*) return 0;; *) return 1;; esac; }
 
 # Shape handling and the id extraction live in ids.py, so a change in bd's
 # --json envelope is one edit rather than three, and is testable. It exits
@@ -232,6 +336,7 @@ ready_ids() {
 first_unparked() {
   for id in $1; do
     is_parked "$id" && continue
+    is_inflight "$id" && continue
     echo "$id"
     return
   done
@@ -280,8 +385,7 @@ queue_empty() {
 if queue_empty; then
   echo "==> queue empty; running triage pass to file beads"
   triage_branch="sandbox/triage-$(date +%Y%m%d-%H%M%S)"
-  enter_branch "$triage_branch" || exit 1
-  run_worker "$(cat "$PROMPT_FILE")
+  triage_prompt="$(cat "$PROMPT_FILE")
 
 $(git_policy "$triage_branch")
 
@@ -301,9 +405,57 @@ file -- a bead asserting a problem you did not actually observe wastes a whole
 worker session.
 
 Leave every bead open and unclaimed. Then stop and report the list."
-  leave_branch || exit 1
+  if [ "$MAX_PARALLEL" -gt 1 ]; then
+    wt_start "$triage_branch" "$triage_prompt" || exit 1
+    echo "    log: $WT_DIR/${triage_branch#sandbox/}.log"
+    triage_int=""
+    trap 'triage_int=1; kill -TERM "$STARTED_PID" 2>/dev/null' INT
+    # A trapped signal cuts `wait` short; the second one waits for docker to go.
+    wait "$STARTED_PID"; wait "$STARTED_PID" 2>/dev/null
+    wt_finish "$triage_branch" || exit 1
+    [ -n "$triage_int" ] && { echo "==> interrupted; stopping."; exit 130; }
+  else
+    enter_branch "$triage_branch" || exit 1
+    run_worker "$triage_prompt"
+    leave_branch || exit 1
+  fi
   echo "==> triage complete"
 fi
+
+# The per-bead task, appended to the standing prompt. $1 is the bead id.
+bead_prompt() {
+  printf '%s' "$(cat "$PROMPT_FILE")
+
+$(git_policy "sandbox/$1")
+
+---
+
+# YOUR TASK THIS SESSION: bead $1
+
+Run \`bd show $1\` first -- it is the specification. Everything above is
+standing context for this repo; the objectives section is background, not your
+assignment. Do only this bead.
+
+If it is already marked in_progress, a previous worker claimed it and did not
+finish. Read its notes, do not assume its partial work is correct, and check
+the working tree for what it left behind before continuing.
+
+Claim it with \`bd update $1 --claim\` before you start.
+
+Close it with \`bd close $1\` ONLY when the evidence the bead's
+acceptance criteria ask for exists and the test suite passes. If you cannot
+finish it, leave it open, say why in \`bd update $1 --notes=...\`, and
+stop -- do not close a bead to make the queue move. If the bead turns out to
+be wrong or already done, close it with \`--reason\` explaining that, which is
+a real outcome and not a failure.
+
+If you discover work outside this bead's scope, file it as a new bead. Do not
+do it now.
+
+Write your handoff to \`$HANDOFF_DIR/$1.md\` BEFORE you close the bead.
+A session that dies after closing and before writing leaves no trace of how
+the work was done; one that dies the other way round is merely unfinished."
+}
 
 last_id=""
 attempts=0
@@ -315,7 +467,122 @@ workers=0
 fast_failures=0
 aborted=""
 
-while :; do
+# Parallel runs: up to MAX_PARALLEL workers at once, one worktree each. The
+# per-bead rules are the sequential loop's below -- park after MAX_ATTEMPTS,
+# never charge a fast failure to the bead, stop after two in a row -- except
+# that attempts are counted per bead across the run, not by consecutive
+# re-dispatch: with several slots the same bead is rarely next in line.
+# Stopping means no new dispatches; workers already running are left to finish.
+if [ "$MAX_PARALLEL" -gt 1 ]; then
+  SLOT_PID=() SLOT_ID=() SLOT_START=()
+  for ((i = 0; i < MAX_PARALLEL; i++)); do SLOT_PID[i]=""; done
+  CHARGED=""        # one entry per dispatch that counts against its bead
+  stop=""
+  interrupted=""
+  hold_until=0
+  REFS_BEFORE="$(protected_refs)"
+  # A script's background jobs ignore SIGINT, so Ctrl-C reaches only this
+  # shell. Pass it on as TERM: docker forwards that to the container.
+  trap 'interrupted=1; echo; echo "==> interrupted; stopping the running workers."
+        for p in "${SLOT_PID[@]}"; do [ -n "$p" ] && kill -TERM "$p" 2>/dev/null; done' INT
+
+  charged() { local n=0 x; for x in $CHARGED; do [ "$x" = "$1" ] && n=$((n + 1)); done; echo "$n"; }
+
+  # The worker in slot $1 exited with status $2.
+  reap() {
+    local id="${SLOT_ID[$1]}" elapsed
+    elapsed=$(( $(date +%s) - SLOT_START[$1] ))
+    SLOT_PID[$1]=""
+    INFLIGHT="$(printf '%s\n' $INFLIGHT | grep -vx "$id" | tr '\n' ' ')"
+    echo "==> $id: worker exited $2 after ${elapsed}s"
+    wt_finish "sandbox/$id" || { aborted="the worktree for $id was not safe to remove"; stop=1; }
+    if [ "$(protected_refs)" != "$REFS_BEFORE" ]; then
+      echo "==> ABORT: a branch outside sandbox/ moved while workers ran."
+      echo "    Workers never merge. Before vs after:"
+      diff <(printf '%s\n' "$REFS_BEFORE") <(protected_refs) | sed 's/^/    /'
+      aborted="a branch outside sandbox/ moved"
+      stop=1
+    fi
+    [ -n "$interrupted" ] && return
+    if [ "$2" -ne 0 ] && [ "$elapsed" -lt "$MIN_WORKER_SECONDS" ]; then
+      fast_failures=$((fast_failures + 1))
+      if [ "$fast_failures" -ge 2 ]; then
+        aborted="two workers in a row exited in under ${MIN_WORKER_SECONDS}s"
+        echo "==> ABORT: $aborted -- a usage or rate limit, an expired token, or a"
+        echo "    dead proxy, not the bead. Nothing was charged against MAX_ATTEMPTS."
+        stop=1
+      else
+        echo "==> not counting that against $id; no new dispatch for ${FAST_FAIL_SLEEP}s"
+        hold_until=$(( $(date +%s) + FAST_FAIL_SLEEP ))
+      fi
+      return
+    fi
+    fast_failures=0
+    CHARGED="$CHARGED $id"
+  }
+
+  while :; do
+    running=0
+    for ((i = 0; i < MAX_PARALLEL; i++)); do
+      p="${SLOT_PID[i]}"
+      [ -n "$p" ] || continue
+      if kill -0 "$p" 2>/dev/null; then running=$((running + 1)); continue; fi
+      wait "$p"
+      reap "$i" "$?"
+    done
+    [ -n "$interrupted" ] && stop=1
+    [ -n "$stop" ] && [ "$running" -eq 0 ] && break
+
+    free=""
+    for ((i = 0; i < MAX_PARALLEL; i++)); do
+      [ -z "${SLOT_PID[i]}" ] && { free=$i; break; }
+    done
+    if [ -z "$stop" ] && [ -n "$free" ] && [ "$(date +%s)" -ge "$hold_until" ]; then
+      TASK_ID="$(next_ready)"
+      if [ -z "$TASK_ID" ]; then
+        TASK_ID="$(next_stale)"
+        [ -n "$TASK_ID" ] && echo "==> nothing ready; re-dispatching stale claim: $TASK_ID"
+      fi
+      if [ -z "$TASK_ID" ]; then
+        if [ "$running" -eq 0 ]; then
+          echo "==> queue drained after $workers worker(s)"
+          break
+        fi
+      elif [ "$(charged "$TASK_ID")" -ge "$MAX_ATTEMPTS" ]; then
+        echo "==> PARKED $TASK_ID: came back unfinished $MAX_ATTEMPTS times."
+        echo "    Inspect with: bd show $TASK_ID"
+        echo "    Its branch and handoff (if any): git show sandbox/$TASK_ID:$HANDOFF_DIR/$TASK_ID.md"
+        PARKED="$PARKED $TASK_ID"
+        continue
+      else
+        workers=$((workers + 1))
+        if [ "$workers" -gt "$MAX_WORKERS" ]; then
+          echo "==> ABORT: hit MAX_WORKERS=$MAX_WORKERS. Queue is growing, not draining."
+          stop=1
+          continue
+        fi
+        echo "==> worker $workers: $TASK_ID (attempt $(( $(charged "$TASK_ID") + 1 )))"
+        echo "    log: $WT_DIR/$TASK_ID.log"
+        if ! wt_start "sandbox/$TASK_ID" "$(bead_prompt "$TASK_ID")"; then
+          aborted="could not start a worktree for $TASK_ID"
+          stop=1
+          continue
+        fi
+        SLOT_PID[free]="$STARTED_PID"
+        SLOT_ID[free]="$TASK_ID"
+        SLOT_START[free]="$(date +%s)"
+        INFLIGHT="$INFLIGHT $TASK_ID"
+        continue
+      fi
+    fi
+    sleep 5
+  done
+  trap - INT
+  [ -n "$interrupted" ] && exit 130
+fi
+
+# Sequential runs (the default). Skipped entirely when the block above ran.
+while [ "$MAX_PARALLEL" -le 1 ]; do
   TASK_ID="$(next_ready)"
 
   if [ -z "$TASK_ID" ]; then
@@ -359,37 +626,7 @@ while :; do
 
   enter_branch "sandbox/$TASK_ID" || { aborted="could not branch for $TASK_ID"; break; }
   started_at="$(date +%s)"
-  run_worker "$(cat "$PROMPT_FILE")
-
-$(git_policy "sandbox/$TASK_ID")
-
----
-
-# YOUR TASK THIS SESSION: bead $TASK_ID
-
-Run \`bd show $TASK_ID\` first -- it is the specification. Everything above is
-standing context for this repo; the objectives section is background, not your
-assignment. Do only this bead.
-
-If it is already marked in_progress, a previous worker claimed it and did not
-finish. Read its notes, do not assume its partial work is correct, and check
-the working tree for what it left behind before continuing.
-
-Claim it with \`bd update $TASK_ID --claim\` before you start.
-
-Close it with \`bd close $TASK_ID\` ONLY when the evidence the bead's
-acceptance criteria ask for exists and the test suite passes. If you cannot
-finish it, leave it open, say why in \`bd update $TASK_ID --notes=...\`, and
-stop -- do not close a bead to make the queue move. If the bead turns out to
-be wrong or already done, close it with \`--reason\` explaining that, which is
-a real outcome and not a failure.
-
-If you discover work outside this bead's scope, file it as a new bead. Do not
-do it now.
-
-Write your handoff to \`$HANDOFF_DIR/$TASK_ID.md\` BEFORE you close the bead.
-A session that dies after closing and before writing leaves no trace of how
-the work was done; one that dies the other way round is merely unfinished."
+  run_worker "$(bead_prompt "$TASK_ID")"
 
   status=$?
   elapsed=$(( $(date +%s) - started_at ))
@@ -447,6 +684,10 @@ echo "Open beads: $(printf '%s' "$open_left" | wc -w | tr -d ' ')"
 echo "Nothing was pushed or merged. Each bead's work is on its own branch:"
 echo "  git for-each-ref --sort=-committerdate --format='%(refname:short)' refs/heads/sandbox/"
 echo "  git log --stat $BASE..sandbox/<bead-id>"
+if [ "$MAX_PARALLEL" -gt 1 ] && [ -n "$(git status --porcelain | grep -E "$BD_EXPORTS")" ]; then
+  echo "bd's exports changed in this tree (workers' bd calls land here); commit them"
+  echo "on $BASE like any bd export: git add .beads/*.jsonl && git commit -m 'bd: export'"
+fi
 
 exit_code=0
 

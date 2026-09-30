@@ -22,6 +22,7 @@ dev = ["verified-sandbox"]
 image = "claude"
 max-attempts = 2                       # same bead unclosed this often -> park it
 max-workers = 25                       # backstop against a runaway queue
+max-parallel = 1                       # workers at once; >1 = one worktree each
 prompt-file = "sandbox-prompt.md"
 handoff-dir = "sandbox-handoffs"
 volumes = []                           # extra named volumes, "name:/path"
@@ -61,6 +62,37 @@ authored as `sandbox <sandbox@verified-sandbox.invalid>`.
 A per-task git policy is appended to every worker prompt and says it supersedes
 the repo prompt's. Older `sandbox-prompt.md` files that say "do not commit"
 still work, but are worth updating to match.
+
+## Parallel workers
+
+`max-parallel = N` runs up to N workers at once in one repo. Each gets its own
+git worktree under `.git/sandbox-worktrees/<bead-id>`, on its own
+`sandbox/<bead-id>` branch, mounted as its `/workspace`; the repo's own tree
+stays on the base branch throughout. Worker output goes to
+`.git/sandbox-worktrees/<bead-id>.log`, not the terminal. The same rules
+apply as a sequential run: leftovers become a WIP commit on the bead's branch,
+a fast failure is never charged to the bead, and a bead is parked after
+`max-attempts` dispatches in the run.
+
+Every `bd` call, from the loop and from every container, goes through a lock
+(`verified_sandbox/bdlock/bd`). bd's embedded Dolt database is not safe for
+several containers at once: unlocked, 47 of 60 concurrent `bd create`s from
+four containers failed with Dolt panics, and some "failed" writes landed
+anyway. `VS_DOCKER_TESTS=1 uv run pytest -k real_embedded` re-checks it.
+
+Things to know:
+
+- Workers' `bd` writes land in the repo's own `.beads/*.jsonl`, since that is
+  where the shared database lives. A parallel run tolerates those two files
+  being modified at start, and says when to commit them.
+- Beads that edit the same files still conflict — at merge time, on review.
+- All workers share one `CLAUDE_CODE_OAUTH_TOKEN`, so N workers use your rate
+  limit N times as fast.
+- Do not commit on the base branch during a run: the loop stops dispatching
+  when any branch outside `sandbox/` moves, the same check that catches a
+  worker merging.
+- A run killed hard (not Ctrl-C) can leave worktrees behind; the next run
+  lists them and refuses to start until they are removed.
 
 ## What `install-hooks` does
 

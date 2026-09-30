@@ -1,0 +1,42 @@
+#!/bin/sh
+# bd, serialized. Put this directory ahead of the real bd on PATH (the host
+# loop) or mount this file over /usr/local/sbin/bd (a container); it takes a
+# lock, then runs the first OTHER bd on PATH.
+#
+# Only parallel runs (max-parallel > 1) use it. bd's own locking holds within
+# one kernel, but N containers plus the host share the embedded Dolt database
+# through Docker Desktop's file sharing, where it does not: four containers
+# doing 15 `bd create`s each saw 47 of 60 fail with Dolt panics ("tables
+# changed"), and some of the "failed" writes landed anyway (2026-09-30). Behind
+# this lock the same run was 60 for 60.
+#
+# mkdir is atomic on the host filesystem, and through the file sharing too, so
+# one lock directory covers every container and the host alike.
+lock="${BD_LOCK_DIR:?bd lock: BD_LOCK_DIR is not set}"
+
+self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+real=""
+IFS=:
+for d in $PATH; do
+  [ -x "$d/bd" ] || continue
+  [ "$(readlink -f "$d/bd" 2>/dev/null || echo "$d/bd")" = "$self" ] && continue
+  real="$d/bd"
+  break
+done
+unset IFS
+[ -n "$real" ] || { echo "bd lock: no real bd on PATH" >&2; exit 127; }
+
+# A holder killed mid-call (docker stop after its grace period) leaves the
+# directory behind. No bd call takes a minute, so one that old is stale.
+waited=0
+until mkdir "$lock" 2>/dev/null; do
+  if [ "$waited" -ge 600 ]; then
+    rmdir "$lock" 2>/dev/null
+    waited=0
+  fi
+  sleep 0.1
+  waited=$((waited + 1))
+done
+trap 'rmdir "$lock" 2>/dev/null' EXIT
+trap 'exit 130' INT TERM
+"$real" "$@"

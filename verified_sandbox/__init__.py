@@ -173,6 +173,9 @@ def conf_text(root, cfg):
         f"IMAGE={shlex.quote(cfg.get('image', 'claude'))}",
         f"MAX_ATTEMPTS={int(cfg.get('max-attempts', 2))}",
         f"MAX_WORKERS={int(cfg.get('max-workers', 25))}",
+        # Workers running at once, each in its own git worktree. 1 is the
+        # original loop, byte for byte: one worker, in the repo's own tree.
+        f"MAX_PARALLEL={max(1, int(cfg.get('max-parallel', 1)))}",
         # A non-zero worker exit inside this many seconds is treated as
         # infrastructure (rate limit, dead token, dead proxy), not as the bead
         # failing -- see the fast-failure block in loop.sh. The floor for a
@@ -352,13 +355,23 @@ def cmd_run(root, cfg):
     with os.fdopen(fd, "w") as fh:
         fh.write(conf_text(root, cfg))
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             ["bash", str(LOOP)],
             cwd=root, env={**os.environ, "SANDBOX_CONF": path},
         )
+        # Ctrl-C reaches the loop directly (same process group), and its trap
+        # winds the run down: WIP-commits leftovers, removes worktrees, drops
+        # the lock. subprocess.run() would SIGKILL it 0.25s into that, leaving
+        # the lock and worktrees behind -- so wait it out instead.
+        while True:
+            try:
+                returncode = proc.wait()
+                break
+            except KeyboardInterrupt:
+                continue
     finally:
         os.unlink(path)
-    raise SystemExit(proc.returncode)
+    raise SystemExit(returncode)
 
 
 def main():

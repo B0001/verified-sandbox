@@ -43,12 +43,33 @@ uv run sandbox install-hooks   # once per repo, and after bd rewrites hooks
 uv run sandbox                 # drain the queue
 ```
 
+## Branch per bead
+
+Each worker runs on its own `sandbox/<bead-id>` branch, cut from whatever branch
+the run started on, and commits its work and handoff there. After it exits the
+loop commits anything it left uncommitted onto that branch as a `WIP` commit,
+then returns to the base branch for the next bead. Workers never push and never
+merge: review a bead with `git log --stat main..sandbox/<bead-id>`, merge what
+passes.
+
+The run refuses to start on a dirty tree, since those edits would be swept into
+the first bead's branch. It stops mid-run if a worker leaves HEAD on another
+branch or moves any branch outside `sandbox/` (a fast-forward merge runs no
+pre-commit hook, so the loop checks the refs itself). Worker commits are
+authored as `sandbox <sandbox@verified-sandbox.invalid>`.
+
+A per-task git policy is appended to every worker prompt and says it supersedes
+the repo prompt's. Older `sandbox-prompt.md` files that say "do not commit"
+still work, but are worth updating to match.
+
 ## What `install-hooks` does
 
-Adds a `BEADS_ACTOR=sandbox` refusal to `.beads/hooks/pre-commit` and
-`pre-push`, above the beads-managed markers so `bd` regenerating the file
-does not eat it, then sets `core.hooksPath` to the **relative** path
-`.beads/hooks`.
+Adds a `BEADS_ACTOR=sandbox` guard to `.beads/hooks/pre-commit` and `pre-push`,
+above the beads-managed markers so `bd` regenerating the file does not eat it,
+then sets `core.hooksPath` to the **relative** path `.beads/hooks`. The
+pre-commit guard refuses a sandbox commit on any branch but `sandbox/<id>`;
+the pre-push guard refuses every sandbox push. Re-running it replaces an older
+guard in place, and `sandbox run` refuses to start until it has been re-run.
 
 Relative matters. An absolute path resolves on the host and points at nothing
 inside the container, and git runs no hook at all — silently, no error — when

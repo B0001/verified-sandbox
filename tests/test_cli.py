@@ -124,6 +124,16 @@ def test_every_named_volume_is_chowned_not_just_the_uv_pair():
     assert not any(v.startswith("/") for v in vols)
 
 
+def test_relative_volume_is_a_bind_mount_not_a_named_volume():
+    """`../sibling` in pyproject.toml resolves against the repo root. Left raw,
+    it doesn't start with `/`, so named_volumes() would chown it as a volume."""
+    cfg = {"volumes": ["../sibling:/workspace-sibling:ro"]}
+    args = vs.docker_args(ROOT, cfg)
+    expected = f"{(Path(ROOT) / '..' / 'sibling').resolve()}:/workspace-sibling:ro"
+    assert expected in args
+    assert vs.named_volumes(args) == ["claude-uv-cache", "claude-uv-python"]
+
+
 def test_chown_covers_the_same_volumes_the_worker_mounts():
     conf = vs.conf_text(ROOT, {"volumes": ["claude-elan:/home/node/.elan"]})
     out = subprocess.run(
@@ -278,51 +288,85 @@ def test_ids_refuses_an_unknown_shape_rather_than_reporting_an_empty_queue():
     assert _ids("not json at all").returncode != 0
 
 
-def _fake_run(tmp_path, docker_exit, docker_sleep=0, max_attempts=2, min_worker_seconds=90):
-    """Drive the real loop.sh against a fake `bd` and a fake `docker`.
+def _fake_run(tmp_path, docker_exit, docker_sleep=0, max_attempts=2, min_worker_seconds=90,
+              queue=("t-1",), worker="", dirty_start=False):
+    """Drive the real loop.sh against a fake `bd` and a fake `docker`, in a real
+    git repo with the real hooks installed.
 
-    The rate-limit behaviour lives in the loop, not in Python, so nothing
-    short of running it actually checks it.
+    The rate-limit and branch-per-bead behaviour live in the loop, not in
+    Python, so nothing short of running it actually checks them. `worker` is
+    shell run in place of the container, in the repo, with $ID set to the bead
+    it was dispatched on; a worker that removes $ID from $FAKE_QUEUE has
+    closed its bead.
     """
+    import os
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "bd").write_text(
         '#!/usr/bin/env bash\n'
-        # One ready, non-epic bead; nothing in progress. Every other bd call
-        # (update/close/notes) is a no-op the worker would have made.
         'case "$1 $2" in\n'
-        '  "ready --json") echo \'{"data":[{"id":"t-1","issue_type":"bug"}]}\' ;;\n'
-        '  "list --status=in_progress") echo \'{"data":[]}\' ;;\n'
+        '  "ready --json")\n'
+        '    printf \'{"data":[\'; sep=\n'
+        '    for i in $(cat "$FAKE_QUEUE"); do\n'
+        '      printf \'%s{"id":"%s","issue_type":"task"}\' "$sep" "$i"; sep=,\n'
+        '    done; echo "]}" ;;\n'
         '  *) echo \'{"data":[]}\' ;;\n'
         'esac\n'
     )
     (bin_dir / "docker").write_text(
         '#!/usr/bin/env bash\n'
-        # The startup chown container must succeed; only the worker fails.
+        # The startup chown container must succeed; only the worker is faked.
         'for a in "$@"; do [ "$a" = "busybox" ] && exit 0; done\n'
+        'for a in "$@"; do case "$a" in *"YOUR TASK THIS SESSION: bead "*)\n'
+        '  ID="$(printf "%s" "$a" | sed -n "s/.*YOUR TASK THIS SESSION: bead //p" | head -1)";;\n'
+        'esac; done\n'
+        'export BEADS_ACTOR=sandbox GIT_AUTHOR_NAME=sandbox GIT_AUTHOR_EMAIL=s@s\n'
+        'export GIT_COMMITTER_NAME=sandbox GIT_COMMITTER_EMAIL=s@s\n'
+        f'{worker}\n'
         f'sleep {docker_sleep}\n'
         f'exit {docker_exit}\n'
     )
     for f in bin_dir.iterdir():
         f.chmod(0o755)
 
-    repo = tmp_path / "repo"
-    repo.mkdir()
+    fake_queue = tmp_path / "queue"
+    fake_queue.write_text("".join(f"{q}\n" for q in queue))
+
+    repo = _git_repo(tmp_path / "repo")
     (repo / "prompt.md").write_text("standing context")
+    vs.cmd_install_hooks(repo)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+    if dirty_start:
+        (repo / "stray.txt").write_text("host edit nobody committed")
+
     conf = tmp_path / "conf.sh"
     conf.write_text(
         "DOCKER_ARGS=(--rm)\nCHOWN_VOLUMES=(uv-cache)\nPARK_ALWAYS=\nIMAGE=fake\n"
         f"MAX_ATTEMPTS={max_attempts}\nMAX_WORKERS=25\n"
         "PROMPT_FILE=prompt.md\nHANDOFF_DIR=handoffs\n"
         f"MIN_WORKER_SECONDS={min_worker_seconds}\nFAST_FAIL_SLEEP=1\n"
+        "SANDBOX_AUTHOR_NAME=sandbox\nSANDBOX_AUTHOR_EMAIL=s@s\n"
     )
-    import os
     loop = Path(vs.__file__).parent / "loop.sh"
-    return subprocess.run(
+    out = subprocess.run(
         ["bash", str(loop)], cwd=repo, capture_output=True, text=True, timeout=120,
-        env={**os.environ, "SANDBOX_CONF": str(conf),
+        env={**os.environ, **HOST_IDENTITY, "SANDBOX_CONF": str(conf),
+             "FAKE_QUEUE": str(fake_queue),
              "PATH": f"{bin_dir}:{os.environ['PATH']}"},
     )
+    out.repo = repo
+    return out
+
+
+HOST_IDENTITY = {"GIT_AUTHOR_NAME": "host", "GIT_AUTHOR_EMAIL": "h@h",
+                 "GIT_COMMITTER_NAME": "host", "GIT_COMMITTER_EMAIL": "h@h"}
+
+
+def _git(repo, *args, env=None):
+    import os
+    return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True,
+                          env={**os.environ, **HOST_IDENTITY, **(env or {})})
 
 
 def test_a_rate_limited_worker_is_not_charged_to_the_bead(tmp_path):
@@ -348,3 +392,137 @@ def test_a_slow_failure_is_still_the_beads_problem(tmp_path):
     combined = out.stdout + out.stderr
     assert "PARKED" in combined, combined
     assert "ABORT" not in combined, "a slow failure is not an infrastructure abort"
+
+
+# --- branch per bead (verified-sandbox-rbz) ---------------------------------
+
+SANDBOX = {"BEADS_ACTOR": "sandbox"}
+
+
+def _hooked_repo(tmp_path):
+    root = _git_repo(tmp_path)
+    vs.cmd_install_hooks(root)
+    _git(root, "add", "-A")
+    assert _git(root, "commit", "-qm", "init").returncode == 0
+    (root / "work.txt").write_text("a worker's change\n")
+    _git(root, "add", "-A")
+    return root
+
+
+def test_a_sandbox_commit_on_its_bead_branch_is_allowed(tmp_path):
+    # The whole feature: under the v1 guard this was refused, so every bead's
+    # work piled up uncommitted in one shared tree.
+    root = _hooked_repo(tmp_path)
+    _git(root, "checkout", "-qb", "sandbox/t-1")
+    got = _git(root, "commit", "-qm", "work", env=SANDBOX)
+    assert got.returncode == 0, got.stderr
+
+
+def test_a_sandbox_commit_anywhere_else_is_refused(tmp_path):
+    root = _hooked_repo(tmp_path)
+    for setup in ([], ["checkout", "-qb", "feature"], ["checkout", "-q", "--detach"],
+                  # A bare "sandbox/" prefix is not a bead branch.
+                  ["checkout", "-qb", "sandbox/"]):
+        if setup:
+            _git(root, *setup)
+        got = _git(root, "commit", "-qm", "work", env=SANDBOX)
+        assert got.returncode != 0, f"sandbox commit allowed after {setup or 'on main'}"
+    # And the host is never affected.
+    assert _git(root, "commit", "-qm", "host work").returncode == 0
+
+
+def test_a_sandbox_push_is_still_refused_even_from_a_bead_branch(tmp_path):
+    root = _hooked_repo(tmp_path)
+    _git(root, "checkout", "-qb", "sandbox/t-1")
+    refused = subprocess.run(["sh", str(root / vs.HOOKS_DIR / "pre-push")],
+                             cwd=root, env={**SANDBOX, "PATH": "/usr/bin:/bin"},
+                             capture_output=True, text=True)
+    assert refused.returncode != 0
+
+
+def test_install_hooks_upgrades_a_v1_guard_and_check_hooks_rejects_it(tmp_path):
+    # Repos installed before branch-per-bead carry the v1 guard, which refuses
+    # every sandbox commit. Re-installing must replace it, not keep it because
+    # "a guard is already present" -- and until then, run must refuse to start.
+    root = _git_repo(tmp_path)
+    hooks = root / vs.HOOKS_DIR
+    hooks.mkdir(parents=True)
+    v1 = ('\n# --- sandbox guard (NOT managed by beads; keep outside the markers below) ---\n'
+          'if [ "${BEADS_ACTOR:-}" = "sandbox" ]; then\n  exit 1\nfi\n'
+          '# --- end sandbox guard ---\n')
+    for hook in vs.GUARDED_HOOKS:
+        (hooks / hook).write_text("#!/usr/bin/env sh\n" + v1 + "# --- BEGIN BEADS INTEGRATION ---\n")
+        (hooks / hook).chmod(0o755)
+    subprocess.run(["git", "config", "core.hooksPath", vs.HOOKS_DIR], cwd=root, check=True)
+    try:
+        vs.check_hooks(root)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("a v1 guard passed the preflight")
+
+    vs.cmd_install_hooks(root)
+    vs.check_hooks(root)
+    text = (hooks / "pre-commit").read_text()
+    assert text.count("# --- sandbox guard") == 1, "v1 guard left alongside v2"
+    assert "BEGIN BEADS INTEGRATION" in text
+
+
+def test_workers_get_a_git_identity():
+    # The container has no git config; without this every worker commit fails
+    # with "Please tell me who you are" and all work lands as WIP.
+    args = vs.docker_args(ROOT, {})
+    for var in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
+        assert any(a.startswith(f"{var}=") for a in args), var
+    # And git must accept the mount at all: /workspace is root-owned in there.
+    assert "GIT_CONFIG_KEY_0=safe.directory" in args and "GIT_CONFIG_VALUE_0=/workspace" in args
+
+
+CLOSE = 'grep -vx "$ID" "$FAKE_QUEUE" > "$FAKE_QUEUE.new"; mv "$FAKE_QUEUE.new" "$FAKE_QUEUE"\n'
+
+
+def _changed(repo, branch):
+    return set(_git(repo, "diff", "--name-only", f"main...{branch}").stdout.split())
+
+
+def test_two_beads_land_on_two_branches_and_main_does_not_move(tmp_path):
+    worker = (
+        'echo "$ID" > "$ID.txt"; mkdir -p handoffs; echo "done" > "handoffs/$ID.md"\n'
+        'git add -A && git commit -qm "$ID" || exit 1\n'
+        # t-2 also leaves something uncommitted: it must reach t-2's branch as
+        # WIP, not vanish and not ride along onto the next bead.
+        '[ "$ID" = t-2 ] && echo leftover > leftover.txt\n'
+        + CLOSE
+    )
+    out = _fake_run(tmp_path, docker_exit=0, queue=("t-1", "t-2"), worker=worker)
+    repo = out.repo
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert _git(repo, "log", "--format=%s", "main").stdout.split() == ["init"], "main moved"
+    assert _changed(repo, "sandbox/t-1") == {"t-1.txt", "handoffs/t-1.md"}
+    assert _changed(repo, "sandbox/t-2") == {"t-2.txt", "handoffs/t-2.md", "leftover.txt"}
+    assert _git(repo, "log", "-1", "--format=%s", "sandbox/t-2").stdout.startswith("WIP")
+    assert _git(repo, "log", "-1", "--format=%an", "sandbox/t-2").stdout.strip() == "sandbox"
+    assert _git(repo, "symbolic-ref", "--short", "HEAD").stdout.strip() == "main"
+    assert _git(repo, "status", "--porcelain").stdout == "", "tree left dirty"
+
+
+def test_a_worker_that_moves_main_stops_the_run(tmp_path):
+    # A fast-forward merge runs no pre-commit hook, so the guard alone cannot
+    # stop it. The loop has to notice, and must not dispatch t-2 onto it.
+    worker = (
+        'echo "$ID" > "$ID.txt"; git add -A && git commit -qm "$ID"\n'
+        'git checkout -q main && git merge -q --ff-only "sandbox/$ID"\n'
+        + CLOSE
+    )
+    out = _fake_run(tmp_path, docker_exit=0, queue=("t-1", "t-2"), worker=worker)
+    combined = out.stdout + out.stderr
+    assert out.returncode != 0 and "outside sandbox/ moved" in combined, combined
+    assert "worker 2" not in combined, "dispatched another worker after main moved"
+
+
+def test_a_dirty_tree_at_start_is_refused(tmp_path):
+    # Those edits would be swept into the first bead's branch and reviewed as
+    # that bead's work.
+    out = _fake_run(tmp_path, docker_exit=0, worker=CLOSE, dirty_start=True)
+    assert out.returncode != 0 and "dirty" in out.stdout, out.stdout
+    assert "worker 1" not in out.stdout

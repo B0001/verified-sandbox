@@ -31,22 +31,52 @@ DEFAULT_ENV = {
 
 # Prose in a prompt is advisory; this is the wall. It must sit OUTSIDE the
 # beads-managed markers, because bd rewrites everything between them.
-GUARD = """
-# --- sandbox guard (NOT managed by beads; keep outside the markers below) ---
-# Workers run with BEADS_ACTOR=sandbox and are told not to commit. Commits from
-# the host are unaffected: BEADS_ACTOR is only set inside the container.
+#
+# Workers commit, but only on their own sandbox/<bead-id> branch (the loop puts
+# them there); a commit on any other branch, or a detached HEAD, is refused.
+# Push is refused outright: the host pushes, a human merges. Commits from the
+# host are unaffected: BEADS_ACTOR is only set inside the container.
+GUARD_START = "# --- sandbox guard"
+GUARD_END = "# --- end sandbox guard ---\n"
+# Bumped whenever the guard's rule changes, so check_hooks can refuse a repo
+# still carrying an older rule (v1 refused every sandbox commit, which would
+# leave each bead branch empty and every worker's work in a WIP commit).
+GUARD_VERSION = "v2"
+GUARDS = {
+    "pre-commit": """
+# --- sandbox guard v2 (NOT managed by beads; keep outside the markers below) ---
 # Managed by `sandbox install-hooks`; re-run it after `bd` regenerates hooks.
 if [ "${BEADS_ACTOR:-}" = "sandbox" ]; then
-  echo >&2 "%s: refusing -- BEADS_ACTOR=sandbox."
-  echo >&2 "Leave the tree dirty and put the exact git commands in your handoff."
-  echo >&2 "A human reviews and commits. This is not a bug in your bead."
+  case "$(git symbolic-ref --short -q HEAD)" in
+    sandbox/?*) ;;
+    *)
+      echo >&2 "pre-commit: refusing -- BEADS_ACTOR=sandbox may only commit on"
+      echo >&2 "its own sandbox/<bead-id> branch. Switch back to the branch the"
+      echo >&2 "loop put you on and commit there. This is not a bug in your bead."
+      exit 1
+      ;;
+  esac
+fi
+# --- end sandbox guard ---
+""",
+    "pre-push": """
+# --- sandbox guard v2 (NOT managed by beads; keep outside the markers below) ---
+# Managed by `sandbox install-hooks`; re-run it after `bd` regenerates hooks.
+if [ "${BEADS_ACTOR:-}" = "sandbox" ]; then
+  echo >&2 "pre-push: refusing -- BEADS_ACTOR=sandbox never pushes. Commit on"
+  echo >&2 "your sandbox/<bead-id> branch; the host pushes and a human merges."
   exit 1
 fi
 # --- end sandbox guard ---
-"""
+""",
+}
+
+# Worker commits need an identity -- the container has no git config -- and a
+# fixed one makes sandbox-authored commits obvious in `git log`.
+SANDBOX_AUTHOR = ("sandbox", "sandbox@verified-sandbox.invalid")
 
 HOOKS_DIR = ".beads/hooks"
-GUARDED_HOOKS = ("pre-commit", "pre-push")
+GUARDED_HOOKS = tuple(GUARDS)
 
 
 def die(*lines):
@@ -93,9 +123,25 @@ def docker_args(root, cfg):
     for name in cfg.get("forward-env", {}):
         args += ["-e", name]
     args += ["-e", "BEADS_ACTOR=sandbox"]
+    # The bind mount's root shows up root-owned inside the container, so git
+    # refuses the repo outright ("dubious ownership") -- not just commits, even
+    # `git status`. Confirmed in the claude-chem image, git 2.39. Env-supplied
+    # config is honoured for safe.directory where a repo-level one is not.
+    args += ["-e", "GIT_CONFIG_COUNT=1", "-e", "GIT_CONFIG_KEY_0=safe.directory",
+             "-e", "GIT_CONFIG_VALUE_0=/workspace"]
+    name, email = SANDBOX_AUTHOR
+    for role in ("AUTHOR", "COMMITTER"):
+        args += ["-e", f"GIT_{role}_NAME={name}", "-e", f"GIT_{role}_EMAIL={email}"]
     args += ["-v", "claude-uv-cache:/home/node/.cache/uv"]
     args += ["-v", "claude-uv-python:/home/node/.local/share/uv/python"]
     for volume in cfg.get("volumes", []):
+        # A source starting with `.` or `~` is a host path relative to the repo
+        # root, so pyproject.toml can say `../narrator` instead of hardcoding
+        # one machine's home directory. Resolved here, before named_volumes()
+        # sees it, or a relative bind mount would be mistaken for a named one.
+        src, sep, rest = volume.partition(":")
+        if src.startswith((".", "~")):
+            volume = str((Path(root) / Path(src).expanduser()).resolve()) + sep + rest
         args += ["-v", volume]
     return args
 
@@ -134,6 +180,8 @@ def conf_text(root, cfg):
         # workers legitimately finish faster than that.
         f"MIN_WORKER_SECONDS={int(cfg.get('min-worker-seconds', 90))}",
         f"FAST_FAIL_SLEEP={int(cfg.get('fast-fail-sleep', 60))}",
+        f"SANDBOX_AUTHOR_NAME={shlex.quote(SANDBOX_AUTHOR[0])}",
+        f"SANDBOX_AUTHOR_EMAIL={shlex.quote(SANDBOX_AUTHOR[1])}",
         f"PROMPT_FILE={shlex.quote(cfg.get('prompt-file', 'sandbox-prompt.md'))}",
         f"HANDOFF_DIR={shlex.quote(cfg.get('handoff-dir', 'sandbox-handoffs'))}",
         "",
@@ -194,24 +242,36 @@ def check_hooks(root):
         if not path.is_file() or not os.access(path, os.X_OK):
             die(f"FATAL: {got}/{hook} is missing or not executable. Workers could",
                 "       commit and push. Fix with: sandbox install-hooks")
-        if "BEADS_ACTOR" not in path.read_text():
+        text = path.read_text()
+        if "BEADS_ACTOR" not in text:
             die(f"FATAL: {got}/{hook} has lost its BEADS_ACTOR guard -- bd rewrites",
                 "       hooks and can drop it. Fix with: sandbox install-hooks")
+        if f"{GUARD_START} {GUARD_VERSION}" not in text:
+            die(f"FATAL: {got}/{hook} carries an older sandbox guard. Workers now",
+                "       commit on sandbox/<bead-id> branches, which it refuses.",
+                "       Fix with: sandbox install-hooks")
 
 
 def cmd_install_hooks(root, cfg=None):
     cfg = cfg or {}
     hooks = root / HOOKS_DIR
     hooks.mkdir(parents=True, exist_ok=True)
-    for hook in GUARDED_HOOKS:
+    for hook, guard in GUARDS.items():
         path = hooks / hook
         text = path.read_text() if path.is_file() else "#!/usr/bin/env sh\n"
-        if "BEADS_ACTOR" in text:
-            print(f"  {HOOKS_DIR}/{hook}: guard already present")
-        else:
-            head, _, tail = text.partition("\n")
-            path.write_text(head + "\n" + GUARD % hook + tail)
-            print(f"  {HOOKS_DIR}/{hook}: guard installed")
+        # Replace, not skip, an existing guard: an older version's rule would
+        # otherwise survive every re-install.
+        if GUARD_START in text:
+            start = text.index(GUARD_START)
+            end = text.index(GUARD_END, start) + len(GUARD_END)
+            # The blank line the guard was inserted with goes too, or each
+            # re-install would grow the file by one.
+            start -= text[:start].endswith("\n\n")
+            text = text[:start] + text[end:]
+        head, _, tail = text.partition("\n")
+        new_text = head + "\n" + guard + tail
+        path.write_text(new_text)
+        print(f"  {HOOKS_DIR}/{hook}: guard {GUARD_VERSION} installed")
         path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
     install_append_only(hooks / "pre-commit", cfg.get("append-only", []))

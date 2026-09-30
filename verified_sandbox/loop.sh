@@ -30,7 +30,8 @@ set -uo pipefail
 
 # shellcheck disable=SC1090
 source "$SANDBOX_CONF"   # DOCKER_ARGS, IMAGE, MAX_ATTEMPTS, MAX_WORKERS, PROMPT_FILE,
-                         # HANDOFF_DIR, MIN_WORKER_SECONDS, FAST_FAIL_SLEEP
+                         # HANDOFF_DIR, MIN_WORKER_SECONDS, FAST_FAIL_SLEEP,
+                         # SANDBOX_AUTHOR_NAME, SANDBOX_AUTHOR_EMAIL
 
 LOCK_DIR=".sandbox.lock"
 
@@ -46,13 +47,103 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
 fi
 trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
 
+# Branch per bead (verified-sandbox-rbz). Each worker runs on its own
+# sandbox/<bead-id> branch cut from the branch the run started on, and commits
+# its work and handoff there; the pre-commit guard refuses a sandbox commit on
+# any other branch. Without this every bead in a run landed in one shared dirty
+# tree, and six beads' interleaved edits had to go in as one commit that could
+# not be reviewed, reverted or bisected per bead (einstein, 2026-09-29).
+#
+# Workers never merge and never push. The loop checks that no branch outside
+# sandbox/ moved while a worker ran, because a fast-forward merge runs no
+# pre-commit hook and would otherwise slip past the guard.
+BASE="$(git symbolic-ref --short -q HEAD)"
+case "$BASE" in
+  "")
+    echo "FATAL: not on a branch (detached HEAD, or not a git repo). Check out"
+    echo "       the branch bead work should start from, then re-run."
+    exit 1 ;;
+  sandbox/*)
+    echo "FATAL: on $BASE, a bead branch -- probably left by an interrupted run."
+    echo "       Check out the base branch (e.g. main), then re-run."
+    exit 1 ;;
+esac
+if [ -n "$(git status --porcelain)" ]; then
+  echo "FATAL: the working tree is dirty. Every bead branches from $BASE, so these"
+  echo "       changes would be swept into the first bead's branch. Commit or"
+  echo "       stash them, then re-run."
+  git status --short | head -20
+  exit 1
+fi
+
+protected_refs() {
+  git for-each-ref --format='%(refname) %(objectname)' refs/heads \
+    | grep -v '^refs/heads/sandbox/'
+}
+
+CURRENT_BRANCH=""
+REFS_BEFORE=""
+
+# Put the next worker on $1, creating it from $BASE if this is the bead's first
+# dispatch. A stale re-dispatch reuses the branch, so the previous attempt's
+# commits are exactly what the prompt tells the worker to inspect.
+enter_branch() {
+  REFS_BEFORE="$(protected_refs)"
+  if git show-ref --verify -q "refs/heads/$1"; then
+    git checkout -q "$1"
+  else
+    git checkout -q -b "$1" "$BASE"
+  fi || { echo "==> ABORT: could not check out $1."; return 1; }
+  CURRENT_BRANCH="$1"
+}
+
+# After a worker exits: commit anything it left uncommitted onto ITS branch, so
+# it is neither lost nor carried onto the next bead's branch, then return to
+# $BASE. Any surprise stops the run rather than guessing -- the next worker must
+# start from a known tree.
+leave_branch() {
+  local b="$CURRENT_BRANCH" now
+  [ -n "$b" ] || return 0
+  CURRENT_BRANCH=""
+  if [ "$(protected_refs)" != "$REFS_BEFORE" ]; then
+    echo "==> ABORT: a branch outside sandbox/ moved while the worker on $b ran."
+    echo "    Workers never merge. Before vs after:"
+    diff <(printf '%s\n' "$REFS_BEFORE") <(protected_refs) | sed 's/^/    /'
+    return 1
+  fi
+  now="$(git symbolic-ref --short -q HEAD)"
+  if [ "$now" != "$b" ]; then
+    echo "==> ABORT: the worker on $b left HEAD on '${now:-detached HEAD}'."
+    echo "    Nothing was committed or switched; inspect by hand."
+    return 1
+  fi
+  if [ -n "$(git status --porcelain)" ]; then
+    echo "==> worker left uncommitted changes; committing them to $b as WIP"
+    git add -A &&
+      GIT_AUTHOR_NAME="$SANDBOX_AUTHOR_NAME" GIT_AUTHOR_EMAIL="$SANDBOX_AUTHOR_EMAIL" \
+      git commit -q -m "WIP ($b): uncommitted changes the worker left behind
+
+Committed by the sandbox loop so they are neither lost nor carried onto the
+next bead's branch. Review before merging." || {
+        echo "==> ABORT: could not commit the leftovers on $b (a hook refused?)."
+        echo "    The tree is still on $b, dirty. Resolve it, then check out $BASE."
+        return 1
+      }
+    if [ -n "$(git status --porcelain)" ]; then
+      echo "==> ABORT: $b is still dirty after the WIP commit (a hook wrote files?)."
+      return 1
+    fi
+  fi
+  git checkout -q "$BASE" || { echo "==> ABORT: could not return to $BASE."; return 1; }
+}
+
 # Ctrl-C must stop the RUN, not just the worker. `docker run -it` forwards the
 # terminal's SIGINT to the container, claude catches it and exits non-zero, and
 # docker itself returns normally -- so bash sees an ordinary failed command and
 # dispatches the next worker. You cannot interrupt the loop, and every Ctrl-C
 # burns an attempt until MAX_ATTEMPTS parks a bead that was never actually
 # tried. The trap fires once the foreground docker returns, which is enough.
-trap 'echo; echo "==> interrupted; stopping."; exit 130' INT
+trap 'echo; echo "==> interrupted; stopping."; leave_branch; exit 130' INT
 
 # Docker initialises a named volume root-owned when its mount path doesn't
 # already exist in the image, so the two uv volumes come up as root:root and
@@ -79,6 +170,20 @@ docker run --rm "${chown_mounts[@]}" busybox \
 run_worker() {
   docker run -it --rm --init "${DOCKER_ARGS[@]}" "$IMAGE" \
     -p "$1" --dangerously-skip-permissions
+}
+
+# Appended to every worker prompt. Repo prompts written before branch-per-bead
+# say "do not commit"; this says which rule wins, so a worker is not left
+# choosing between two instructions.
+git_policy() {
+  printf '%s\n' "## Git on this run (supersedes any git policy above)
+
+You are on branch \`$1\`, cut from \`$BASE\` for this task alone. Commit your
+work AND your handoff file here, in as many commits as make the diff easy to
+review; the pre-commit hook refuses a commit on any other branch. Do not switch
+branches, do not merge, do not rebase onto or reset another branch, and do not
+push -- the host pushes and a human merges. Anything you leave uncommitted is
+committed for you as WIP, which is worse for your reviewer than a real message."
 }
 
 # Beads that hit MAX_ATTEMPTS. They are skipped for the rest of the run and
@@ -174,7 +279,11 @@ queue_empty() {
 # code.
 if queue_empty; then
   echo "==> queue empty; running triage pass to file beads"
+  triage_branch="sandbox/triage-$(date +%Y%m%d-%H%M%S)"
+  enter_branch "$triage_branch" || exit 1
   run_worker "$(cat "$PROMPT_FILE")
+
+$(git_policy "$triage_branch")
 
 ---
 
@@ -192,6 +301,7 @@ file -- a bead asserting a problem you did not actually observe wastes a whole
 worker session.
 
 Leave every bead open and unclaimed. Then stop and report the list."
+  leave_branch || exit 1
   echo "==> triage complete"
 fi
 
@@ -232,7 +342,7 @@ while :; do
   if [ "$attempts" -gt "$MAX_ATTEMPTS" ]; then
     echo "==> PARKED $TASK_ID: came back unfinished $MAX_ATTEMPTS times."
     echo "    Inspect with: bd show $TASK_ID"
-    echo "    Its handoff (if any): $HANDOFF_DIR/$TASK_ID.md"
+    echo "    Its branch and handoff (if any): git show sandbox/$TASK_ID:$HANDOFF_DIR/$TASK_ID.md"
     PARKED="$PARKED $TASK_ID"
     last_id=""
     attempts=0
@@ -247,8 +357,11 @@ while :; do
 
   echo "==> worker $workers: $TASK_ID (attempt $attempts)"
 
+  enter_branch "sandbox/$TASK_ID" || { aborted="could not branch for $TASK_ID"; break; }
   started_at="$(date +%s)"
   run_worker "$(cat "$PROMPT_FILE")
+
+$(git_policy "sandbox/$TASK_ID")
 
 ---
 
@@ -280,6 +393,7 @@ the work was done; one that dies the other way round is merely unfinished."
 
   status=$?
   elapsed=$(( $(date +%s) - started_at ))
+  leave_branch || { aborted="the tree was not safe to hand to the next worker"; break; }
   [ "$status" -ne 0 ] && echo "==> worker exited $status after ${elapsed}s"
 
   # A worker cannot fail a bead in seconds. It has to read the bead, look at
@@ -328,9 +442,11 @@ stranded="$(ids_by_status in_progress)"
 open_left="$(ids_by_status open)"
 
 echo
-echo "Handoffs:   $HANDOFF_DIR/"
+echo "Handoffs:   $HANDOFF_DIR/ on each sandbox/<bead-id> branch"
 echo "Open beads: $(printf '%s' "$open_left" | wc -w | tr -d ' ')"
-echo "Nothing was committed or pushed. Review with: git status && git diff"
+echo "Nothing was pushed or merged. Each bead's work is on its own branch:"
+echo "  git for-each-ref --sort=-committerdate --format='%(refname:short)' refs/heads/sandbox/"
+echo "  git log --stat $BASE..sandbox/<bead-id>"
 
 exit_code=0
 

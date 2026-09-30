@@ -1,4 +1,13 @@
 #!/usr/bin/env sh
+
+# --- sandbox guard v2 (NOT managed by beads; keep outside the markers below) ---
+# Managed by `sandbox install-hooks`; re-run it after `bd` regenerates hooks.
+if [ "${BEADS_ACTOR:-}" = "sandbox" ]; then
+  echo >&2 "pre-push: refusing -- BEADS_ACTOR=sandbox never pushes. Commit on"
+  echo >&2 "your sandbox/<bead-id> branch; the host pushes and a human merges."
+  exit 1
+fi
+# --- end sandbox guard ---
 # --- BEGIN BEADS INTEGRATION v1.1.2 ---
 # This section is managed by beads. Do not remove these markers.
 if command -v bd >/dev/null 2>&1; then

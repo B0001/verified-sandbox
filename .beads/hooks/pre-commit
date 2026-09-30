@@ -1,4 +1,19 @@
 #!/usr/bin/env sh
+
+# --- sandbox guard v2 (NOT managed by beads; keep outside the markers below) ---
+# Managed by `sandbox install-hooks`; re-run it after `bd` regenerates hooks.
+if [ "${BEADS_ACTOR:-}" = "sandbox" ]; then
+  case "$(git symbolic-ref --short -q HEAD)" in
+    sandbox/?*) ;;
+    *)
+      echo >&2 "pre-commit: refusing -- BEADS_ACTOR=sandbox may only commit on"
+      echo >&2 "its own sandbox/<bead-id> branch. Switch back to the branch the"
+      echo >&2 "loop put you on and commit there. This is not a bug in your bead."
+      exit 1
+      ;;
+  esac
+fi
+# --- end sandbox guard ---
 # --- BEGIN BEADS INTEGRATION v1.1.2 ---
 # This section is managed by beads. Do not remove these markers.
 if command -v bd >/dev/null 2>&1; then

@@ -153,6 +153,14 @@ next bead's branch. Review before merging." || {
       echo "==> ABORT: could not commit the leftovers on $1 (a hook refused?)."
       return 1
     }
+  # The beads pre-commit hook re-exports .beads/issues.jsonl after `git add -A`
+  # ran, leaving it unstaged. Its export is idempotent, so one follow-up commit
+  # settles it; anything still dirty after that is a real problem.
+  if [ -n "$(git status --porcelain)" ]; then
+    git add -A &&
+      GIT_AUTHOR_NAME="$SANDBOX_AUTHOR_NAME" GIT_AUTHOR_EMAIL="$SANDBOX_AUTHOR_EMAIL" \
+      git commit -q -m "WIP ($1): files a commit hook wrote during the WIP commit" || true
+  fi
   if [ -n "$(git status --porcelain)" ]; then
     echo "==> ABORT: $1 is still dirty after the WIP commit (a hook wrote files?)."
     return 1

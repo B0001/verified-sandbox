@@ -290,7 +290,7 @@ def test_ids_refuses_an_unknown_shape_rather_than_reporting_an_empty_queue():
 
 def _fake_run(tmp_path, docker_exit, docker_sleep=0, max_attempts=2, min_worker_seconds=90,
               queue=("t-1",), worker="", dirty_start=False, max_parallel=1,
-              bd_export_dirty=False):
+              bd_export_dirty=False, before=None):
     """Drive the real loop.sh against a fake `bd` and a fake `docker`, in a real
     git repo with the real hooks installed.
 
@@ -313,6 +313,9 @@ def _fake_run(tmp_path, docker_exit, docker_sleep=0, max_attempts=2, min_worker_
         '      [ -e "$FAKE_QUEUE.closed/$i" ] && continue\n'
         '      printf \'%s{"id":"%s","issue_type":"task"}\' "$sep" "$i"; sep=,\n'
         '    done; echo "]}" ;;\n'
+        '  "show "*)\n'
+        '    st=open; [ -e "$FAKE_QUEUE.closed/$2" ] && st=closed\n'
+        '    printf \'{"data":[{"id":"%s","status":"%s"}]}\\n\' "$2" "$st" ;;\n'
         '  *) echo \'{"data":[]}\' ;;\n'
         'esac\n'
     )
@@ -344,6 +347,8 @@ def _fake_run(tmp_path, docker_exit, docker_sleep=0, max_attempts=2, min_worker_
         (repo / ".beads" / "interactions.jsonl").write_text("{}\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "init")
+    if before:
+        before(repo)
     if dirty_start:
         (repo / "stray.txt").write_text("host edit nobody committed")
     if bd_export_dirty:
@@ -514,7 +519,9 @@ def test_two_beads_land_on_two_branches_and_main_does_not_move(tmp_path):
     assert out.returncode == 0, out.stdout + out.stderr
     assert _git(repo, "log", "--format=%s", "main").stdout.split() == ["init"], "main moved"
     assert _changed(repo, "sandbox/t-1") == {"t-1.txt", "handoffs/t-1.md"}
-    assert _changed(repo, "sandbox/t-2") == {"t-2.txt", "handoffs/t-2.md", "leftover.txt"}
+    # t-2 was cut from the stack, which already held closed t-1.
+    t2_own = set(_git(repo, "diff", "--name-only", "sandbox/t-1", "sandbox/t-2").stdout.split())
+    assert t2_own == {"t-2.txt", "handoffs/t-2.md", "leftover.txt"}
     assert _git(repo, "log", "-1", "--format=%s", "sandbox/t-2").stdout.startswith("WIP")
     assert _git(repo, "log", "-1", "--format=%an", "sandbox/t-2").stdout.strip() == "sandbox"
     assert _git(repo, "symbolic-ref", "--short", "HEAD").stdout.strip() == "main"
@@ -541,3 +548,76 @@ def test_a_dirty_tree_at_start_is_refused(tmp_path):
     out = _fake_run(tmp_path, docker_exit=0, worker=CLOSE, dirty_start=True)
     assert out.returncode != 0 and "dirty" in out.stdout, out.stdout
     assert "worker 1" not in out.stdout
+
+
+# --- the stack (verified-sandbox-jbv) ---------------------------------------
+
+def _first_parents(repo, rng):
+    return _git(repo, "log", "--first-parent", "--format=%s", rng).stdout.splitlines()
+
+
+def test_a_closed_beads_work_reaches_the_next_worker_through_the_stack(tmp_path):
+    # Cut from main, t-2 could not see t-1's file, and rebuilt it -- in chem,
+    # three beads wrote three copies of one module. Main still never moves.
+    worker = (
+        '[ "$ID" = t-2 ] && { [ -e t-1.txt ] || exit 7; }\n'
+        'echo "$ID" > "$ID.txt"; git add -A && git commit -qm "$ID" || exit 1\n' + CLOSE
+    )
+    out = _fake_run(tmp_path, docker_exit=0, queue=("t-1", "t-2"), worker=worker)
+    repo = out.repo
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert _git(repo, "log", "--format=%s", "main").stdout.split() == ["init"], "main moved"
+    assert _first_parents(repo, "main..sandbox/stack") == [
+        "Merge sandbox/t-2 into sandbox/stack", "Merge sandbox/t-1 into sandbox/stack"]
+    assert "git merge sandbox/stack" in out.stdout
+    assert _git(repo, "worktree", "list").stdout.count("\n") == 1, "stack worktree left behind"
+
+
+def test_an_unclosed_bead_stays_off_the_stack(tmp_path):
+    # Unfinished work is the next worker's input only if it re-dispatches the
+    # same bead; it must not leak into every other bead's base.
+    worker = 'echo "$ID" > "$ID.txt"; git add -A && git commit -qm "$ID"\n'
+    out = _fake_run(tmp_path, docker_exit=0, docker_sleep=2, max_attempts=1,
+                    min_worker_seconds=1, worker=worker)
+    repo = out.repo
+    assert _git(repo, "rev-parse", "sandbox/stack").stdout == _git(repo, "rev-parse", "main").stdout
+
+
+def test_a_closed_bead_that_conflicts_with_the_stack_is_reported_not_merged(tmp_path):
+    # A stale re-dispatch reuses its old branch, which may predate the stack's
+    # newer work. Both rewrite shared.txt: the merge must abort cleanly, leave
+    # the stack as it was, and name the branch for a human.
+    def before(repo):
+        for branch, text in (("sandbox/stack", "stack"), ("sandbox/t-1", "old")):
+            _git(repo, "checkout", "-qb", branch, "main")
+            (repo / "shared.txt").write_text(text + "\n")
+            _git(repo, "add", "-A")
+            _git(repo, "commit", "-qm", branch, env=SANDBOX)
+        _git(repo, "checkout", "-q", "main")
+    worker = 'echo t-1 > shared.txt; git add -A && git commit -qm t-1 || exit 1\n' + CLOSE
+    out = _fake_run(tmp_path, docker_exit=0, worker=worker, before=before)
+    repo = out.repo
+    combined = out.stdout + out.stderr
+    assert "conflicts with sandbox/stack" in combined, combined
+    assert "sandbox/t-1" in out.stdout.split("merge these by hand")[-1], out.stdout
+    assert _first_parents(repo, "main..sandbox/stack") == ["sandbox/stack"]
+    assert _git(repo, "status", "--porcelain").stdout == "", "tree left dirty"
+    assert _git(repo, "worktree", "list").stdout.count("\n") == 1, "stack worktree left behind"
+
+
+def test_bd_export_conflicts_do_not_keep_a_bead_off_the_stack(tmp_path):
+    # Every bead branch rewrites bd's exports, so they collide on nearly every
+    # merge. They are passive copies of the database: take the incoming side,
+    # never treat that as a real conflict.
+    def before(repo):
+        for branch, text in (("sandbox/stack", "stack"), ("sandbox/t-1", "old")):
+            _git(repo, "checkout", "-qb", branch, "main")
+            (repo / ".beads" / "issues.jsonl").write_text(f'{{"v":"{text}"}}\n')
+            _git(repo, "add", "-A")
+            _git(repo, "commit", "-qm", branch, env=SANDBOX)
+        _git(repo, "checkout", "-q", "main")
+    worker = 'echo t-1 > t-1.txt; git add -A && git commit -qm t-1 || exit 1\n' + CLOSE
+    out = _fake_run(tmp_path, docker_exit=0, worker=worker, before=before)
+    repo = out.repo
+    assert "merged sandbox/t-1 into sandbox/stack" in out.stdout, out.stdout + out.stderr
+    assert _git(repo, "show", "sandbox/stack:.beads/issues.jsonl").stdout == '{"v":"old"}\n'

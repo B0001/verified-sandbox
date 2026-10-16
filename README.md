@@ -47,12 +47,25 @@ uv run sandbox                 # drain the queue
 
 ## Branch per bead
 
-Each worker runs on its own `sandbox/<bead-id>` branch, cut from whatever branch
-the run started on, and commits its work and handoff there. After it exits the
-loop commits anything it left uncommitted onto that branch as a `WIP` commit,
-then returns to the base branch for the next bead. Workers never push and never
-merge: review a bead with `git log --stat main..sandbox/<bead-id>`, merge what
-passes.
+Each worker runs on its own `sandbox/<bead-id>` branch and commits its work and
+handoff there. After it exits the loop commits anything it left uncommitted onto
+that branch as a `WIP` commit, then returns to the base branch for the next bead.
+Workers never push and never merge.
+
+The loop keeps one more branch, `sandbox/stack`: the base branch plus every bead
+branch whose bead was **closed**, each merged `--no-ff`. New bead branches are
+cut from the stack, not the base, so a worker builds on what earlier workers
+finished instead of rebuilding it on a parallel copy. An unclosed (WIP) branch
+stays off the stack, and so does a closed one that conflicts with it; the run's
+report names those. bd's exports never count as a conflict (the incoming side
+wins; `interactions.jsonl` is unioned). Review and merge the one branch:
+
+    git log --first-parent --format='%h %s' main..sandbox/stack
+    git merge sandbox/stack
+
+Once the stack is in the base branch, the next run starts it over from there.
+If you commit to the base branch without merging the stack, the next run merges
+the base branch into the stack first, and stops if that conflicts.
 
 The run refuses to start on a dirty tree, since those edits would be swept into
 the first bead's branch. It stops mid-run if a worker leaves HEAD on another
@@ -86,7 +99,9 @@ Things to know:
 - Workers' `bd` writes land in the repo's own `.beads/*.jsonl`, since that is
   where the shared database lives. A parallel run tolerates those two files
   being modified at start, and says when to commit them.
-- Beads that edit the same files still conflict — at merge time, on review.
+- Beads running at the same time (parallel runs) are cut from the same stack, so
+  two that edit the same files still conflict; the second to close is left off
+  the stack and reported.
 - All workers share one `CLAUDE_CODE_OAUTH_TOKEN`, so N workers use your rate
   limit N times as fast.
 - Do not commit on the base branch during a run: the loop stops dispatching

@@ -95,10 +95,87 @@ protected_refs() {
     | grep -v '^refs/heads/sandbox/'
 }
 
+# The stack (verified-sandbox-jbv): $BASE plus every bead branch whose bead got
+# closed, each merged --no-ff. New bead branches are cut from it, so a worker
+# sees the work earlier workers finished but no human has merged yet. Cut from
+# $BASE, they could not: in chem a run left 22 closed branches unmerged, later
+# workers rebuilt the same module three times on parallel copies, and a human
+# hand-merged the three-way conflict. A human reviews and merges this ONE
+# branch. Unclosed (WIP) branches stay out; so does a branch that conflicts.
+STACK="sandbox/stack"
+STACK_WT="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)/sandbox-stack"
+
+# Merge $1 into $STACK in a throwaway worktree, so the host tree never leaves
+# $BASE. Hooks are off for this: these are the loop's own commits, and bd's
+# hooks would re-import exports mid-merge. bd's exports are passive copies of
+# the database, so a conflict in them takes the incoming side (interactions:
+# the union); any other conflict aborts the merge and returns 1.
+stack_merge() {
+  local f rc=0 g=(git -c core.hooksPath=/dev/null -C "$STACK_WT")
+  git worktree remove --force "$STACK_WT" 2>/dev/null; git worktree prune
+  git -c core.hooksPath=/dev/null worktree add -q "$STACK_WT" "$STACK" || return 1
+  if ! GIT_AUTHOR_NAME="$SANDBOX_AUTHOR_NAME" GIT_AUTHOR_EMAIL="$SANDBOX_AUTHOR_EMAIL" \
+      "${g[@]}" merge -q --no-ff --no-edit -m "Merge $1 into $STACK" "$1" >/dev/null 2>&1; then
+    for f in $("${g[@]}" diff --name-only --diff-filter=U); do
+      case "$f" in
+        .beads/interactions.jsonl)
+          { "${g[@]}" show ":2:$f"; "${g[@]}" show ":3:$f"; } | awk '!seen[$0]++' > "$STACK_WT/$f" ;;
+        .beads/*.jsonl) "${g[@]}" checkout -q --theirs -- "$f" ;;
+        *) rc=1; break ;;
+      esac
+      "${g[@]}" add -- "$f"
+    done
+    if [ "$rc" -eq 0 ]; then
+      GIT_AUTHOR_NAME="$SANDBOX_AUTHOR_NAME" GIT_AUTHOR_EMAIL="$SANDBOX_AUTHOR_EMAIL" \
+        "${g[@]}" commit -q --no-edit || rc=1
+    fi
+    [ "$rc" -eq 0 ] || "${g[@]}" merge --abort
+  fi
+  git worktree remove --force "$STACK_WT"
+  return "$rc"
+}
+
+# A stack that is already in $BASE (a human merged it, or it is new) restarts
+# from $BASE. One still ahead keeps its work, and takes in anything committed
+# on $BASE since, so new branches miss neither.
+if ! git show-ref --verify -q "refs/heads/$STACK" || git merge-base --is-ancestor "$STACK" "$BASE"; then
+  git branch -f "$STACK" "$BASE" >/dev/null
+else
+  echo "==> $STACK has $(git rev-list --count "$BASE..$STACK") commit(s) not on $BASE yet; new beads build on it"
+  if ! git merge-base --is-ancestor "$BASE" "$STACK"; then
+    stack_merge "$BASE" || {
+      echo "FATAL: $BASE no longer merges cleanly into $STACK. Merge $STACK into $BASE"
+      echo "       (or delete it to start over), then re-run."
+      exit 1
+    }
+  fi
+fi
+
+bead_closed() {
+  [ "$(bd show "$1" --json 2>/dev/null | python3 -c 'import json, sys
+d = json.load(sys.stdin)
+d = d.get("data", d) if isinstance(d, dict) else d
+print((d[0] if isinstance(d, list) else d).get("status", ""))' 2>/dev/null)" = closed ]
+}
+
+# After bead $1's worker exits: if the bead is closed, put its branch on the stack.
+UNSTACKED=""
+stack_if_closed() {
+  local b="sandbox/$1"
+  bead_closed "$1" || return 0
+  git merge-base --is-ancestor "$b" "$STACK" && return 0
+  if stack_merge "$b"; then
+    echo "==> $1 closed; merged $b into $STACK"
+  else
+    UNSTACKED="$UNSTACKED $1"
+    echo "==> $1 closed, but $b conflicts with $STACK; left out for a human to merge"
+  fi
+}
+
 CURRENT_BRANCH=""
 REFS_BEFORE=""
 
-# Put the next worker on $1, creating it from $BASE if this is the bead's first
+# Put the next worker on $1, creating it from $STACK if this is the bead's first
 # dispatch. A stale re-dispatch reuses the branch, so the previous attempt's
 # commits are exactly what the prompt tells the worker to inspect.
 enter_branch() {
@@ -106,7 +183,7 @@ enter_branch() {
   if git show-ref --verify -q "refs/heads/$1"; then
     git checkout -q "$1"
   else
-    git checkout -q -b "$1" "$BASE"
+    git checkout -q -b "$1" "$STACK"
   fi || { echo "==> ABORT: could not check out $1."; return 1; }
   CURRENT_BRANCH="$1"
 }
@@ -241,7 +318,7 @@ wt_start() {
   if git show-ref --verify -q "refs/heads/$b"; then
     git worktree add -q "$wt" "$b"
   else
-    git worktree add -q -b "$b" "$wt" "$BASE"
+    git worktree add -q -b "$b" "$wt" "$STACK"
   fi || {
     echo "==> ABORT: could not create a worktree for $b."
     # No worker has run in it, so there is nothing to keep -- and a half-made
@@ -288,7 +365,8 @@ wt_finish() {
 git_policy() {
   printf '%s\n' "## Git on this run (supersedes any git policy above)
 
-You are on branch \`$1\`, cut from \`$BASE\` for this task alone. Commit your
+You are on branch \`$1\`, cut for this task alone from \`$STACK\` (\`$BASE\` plus
+every bead this loop closed that no human has merged yet). Commit your
 work AND your handoff file here, in as many commits as make the diff easy to
 review; the pre-commit hook refuses a commit on any other branch. Do not switch
 branches, do not merge, do not rebase onto or reset another branch, and do not
@@ -605,6 +683,7 @@ if [ "$MAX_PARALLEL" -gt 1 ]; then
     echo "==> $id: worker exited $2 after ${elapsed}s"
     wt_finish "sandbox/$id" || { aborted="the worktree for $id was not safe to remove"; stop=1; }
     shared_done "$id" || { aborted="could not publish $id's bead state"; stop=1; }
+    stack_if_closed "$id"
     if [ "$(protected_refs)" != "$REFS_BEFORE" ]; then
       echo "==> ABORT: a branch outside sandbox/ moved while workers ran."
       echo "    Workers never merge. Before vs after:"
@@ -737,6 +816,7 @@ while [ "$MAX_PARALLEL" -le 1 ]; do
   elapsed=$(( $(date +%s) - started_at ))
   leave_branch || { aborted="the tree was not safe to hand to the next worker"; break; }
   shared_done "$TASK_ID" || { aborted="could not publish $TASK_ID's bead state"; break; }
+  stack_if_closed "$TASK_ID"
   [ "$status" -ne 0 ] && echo "==> worker exited $status after ${elapsed}s"
 
   # A worker cannot fail a bead in seconds. It has to read the bead, look at
@@ -787,9 +867,18 @@ open_left="$(ids_by_status open)"
 echo
 echo "Handoffs:   $HANDOFF_DIR/ on each sandbox/<bead-id> branch"
 echo "Open beads: $(printf '%s' "$open_left" | wc -w | tr -d ' ')"
-echo "Nothing was pushed or merged. Each bead's work is on its own branch:"
+echo "Nothing was pushed, and $BASE did not move. Each bead's work is on its own branch:"
 echo "  git for-each-ref --sort=-committerdate --format='%(refname:short)' refs/heads/sandbox/"
 echo "  git log --stat $BASE..sandbox/<bead-id>"
+if [ -n "$(git rev-list -1 "$BASE..$STACK")" ]; then
+  echo "Every closed bead's branch is also merged into $STACK. Review and merge that one:"
+  echo "  git log --first-parent --format='%h %s' $BASE..$STACK"
+  echo "  git merge $STACK"
+fi
+if [ -n "$UNSTACKED" ]; then
+  echo "Closed but NOT in $STACK (conflicted with it; merge these by hand):"
+  for id in $UNSTACKED; do echo "    sandbox/$id"; done
+fi
 if [ "$MAX_PARALLEL" -gt 1 ] && [ -n "$(git status --porcelain | grep -E "$BD_EXPORTS")" ]; then
   echo "bd's exports changed in this tree (workers' bd calls land here); commit them"
   echo "on $BASE like any bd export: git add .beads/*.jsonl && git commit -m 'bd: export'"

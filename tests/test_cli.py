@@ -39,6 +39,20 @@ def test_the_repo_is_always_mounted_and_the_worker_is_always_marked():
     assert "BEADS_ACTOR=sandbox" in args
 
 
+def test_a_store_on_a_host_dolt_server_is_reached_through_the_host(tmp_path):
+    # Inside the container 127.0.0.1 is the container, so a repo whose beads
+    # moved onto a host Dolt server (Gas City) needs the host's name instead.
+    beads = tmp_path / ".beads"
+    beads.mkdir()
+    (beads / "metadata.json").write_text('{"dolt_mode": "server"}')
+    (beads / "dolt-server.port").write_text("48792\n")
+    args = vs.docker_args(tmp_path, {})
+    assert "BEADS_DOLT_SERVER_HOST=host.docker.internal" in args
+    assert "BEADS_DOLT_SERVER_PORT=48792" in args
+    (beads / "metadata.json").write_text('{"dolt_mode": "embedded"}')
+    assert not any(a.startswith("BEADS_DOLT_SERVER") for a in vs.docker_args(tmp_path, {}))
+
+
 def test_conf_survives_a_value_containing_a_space():
     # The whole reason DOCKER_ARGS is a bash array and not a string.
     conf = vs.conf_text(Path("/a path/repo"), {"env": {"X": "one two"}})

@@ -7,6 +7,7 @@ forward, which extra volumes to mount, how many workers -- comes from
 needs editing when the loop is refined; only this package is bumped.
 """
 
+import json
 import os
 import shlex
 import socket
@@ -104,6 +105,33 @@ def load_config(root):
     return data.get("tool", {}).get("sandbox", {}) or {}
 
 
+def beads_server_env(root):
+    """Where a worker's bd finds a beads store that lives on a host Dolt server.
+
+    A repo moved onto a Gas City's managed Dolt server has dolt_mode "server" in
+    .beads/metadata.json, and bd connects to 127.0.0.1 -- inside the container
+    that is the container itself, so every worker's bd call fails. The host's
+    loopback is host.docker.internal, through the same --add-host the model
+    proxy uses. The port comes from the file gc keeps in .beads. An embedded
+    store, or no store at all, needs nothing.
+    """
+    beads = Path(root) / ".beads"
+    try:
+        mode = json.loads((beads / "metadata.json").read_text()).get("dolt_mode")
+    except (OSError, ValueError):
+        return {}
+    if mode != "server":
+        return {}
+    env = {"BEADS_DOLT_SERVER_HOST": "host.docker.internal"}
+    try:
+        port = (beads / "dolt-server.port").read_text().strip()
+    except OSError:
+        port = ""
+    if port.isdigit():
+        env["BEADS_DOLT_SERVER_PORT"] = port
+    return env
+
+
 def docker_args(root, cfg):
     """Flags for `docker run`, in the order the hand-written scripts used them.
 
@@ -112,7 +140,7 @@ def docker_args(root, cfg):
     it in docker's argv, where any user on the host reads it out of `ps`.
     `[tool.sandbox.env]` is for values that are safe to be seen there.
     """
-    env = {**DEFAULT_ENV, **cfg.get("env", {})}
+    env = {**DEFAULT_ENV, **beads_server_env(root), **cfg.get("env", {})}
     args = ["-e", "CLAUDE_CODE_OAUTH_TOKEN"]
     for name, value in env.items():
         if value != "":

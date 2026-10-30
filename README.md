@@ -99,6 +99,10 @@ Things to know:
 - Workers' `bd` writes land in the repo's own `.beads/*.jsonl`, since that is
   where the shared database lives. A parallel run tolerates those two files
   being modified at start, and says when to commit them.
+- A repo whose beads live on a host Dolt server (`dolt_mode: server`, e.g. a Gas
+  City rig) gets `BEADS_DOLT_SERVER_HOST=host.docker.internal` and the port from
+  `.beads/dolt-server.port`, since 127.0.0.1 inside a container is the container.
+  Workers reach it the way they reach the model proxy.
 - Beads running at the same time (parallel runs) are cut from the same stack, so
   two that edit the same files still conflict; the second to close is left off
   the stack and reported.
